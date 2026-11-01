@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"sync"
@@ -22,7 +23,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{incidents: make(map[int]model.Incident), nextID: 1}
 }
 
-func (s *MemoryStore) Create(title, severity string) (model.Incident, error) {
+func (s *MemoryStore) Create(_ context.Context, title, severity string) (model.Incident, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -38,7 +39,7 @@ func (s *MemoryStore) Create(title, severity string) (model.Incident, error) {
 	return inc, nil
 }
 
-func (s *MemoryStore) Get(id int) (model.Incident, error) {
+func (s *MemoryStore) Get(_ context.Context, id int) (model.Incident, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -49,7 +50,7 @@ func (s *MemoryStore) Get(id int) (model.Incident, error) {
 	return inc, nil
 }
 
-func (s *MemoryStore) List() ([]model.Incident, error) {
+func (s *MemoryStore) List(_ context.Context) ([]model.Incident, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -62,7 +63,7 @@ func (s *MemoryStore) List() ([]model.Incident, error) {
 	return list, nil
 }
 
-func (s *MemoryStore) Update(id int, title, severity, status string) (model.Incident, error) {
+func (s *MemoryStore) Update(_ context.Context, id int, title, severity, status string) (model.Incident, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -77,7 +78,7 @@ func (s *MemoryStore) Update(id int, title, severity, status string) (model.Inci
 	return inc, nil
 }
 
-func (s *MemoryStore) Delete(id int) error {
+func (s *MemoryStore) Delete(_ context.Context, id int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

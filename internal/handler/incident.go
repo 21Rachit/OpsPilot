@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -16,11 +17,11 @@ import (
 // IncidentStore is what the handler needs from storage.
 // MemoryStore satisfies it today; a Postgres store will satisfy it in Step 2.
 type IncidentStore interface {
-	Create(title, severity string) (model.Incident, error)
-	Get(id int) (model.Incident, error)
-	List() ([]model.Incident, error)
-	Update(id int, title, severity, status string) (model.Incident, error)
-	Delete(id int) error
+	Create(ctx context.Context, title, severity string) (model.Incident, error)
+	Get(ctx context.Context, id int) (model.Incident, error)
+	List(ctx context.Context) ([]model.Incident, error)
+	Update(ctx context.Context, id int, title, severity, status string) (model.Incident, error)
+	Delete(ctx context.Context, id int) error
 }
 
 type IncidentHandler struct {
@@ -72,7 +73,7 @@ func (h *IncidentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inc, err := h.store.Create(req.Title, req.Severity)
+	inc, err := h.store.Create(r.Context(), req.Title, req.Severity)
 	if err != nil {
 		slog.Error("create: store failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not create incident")
@@ -83,7 +84,7 @@ func (h *IncidentHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *IncidentHandler) List(w http.ResponseWriter, r *http.Request) {
-	list, err := h.store.List()
+	list, err := h.store.List(r.Context())
 	if err != nil {
 		slog.Error("list: store failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not list incidents")
@@ -99,7 +100,7 @@ func (h *IncidentHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inc, err := h.store.Get(id)
+	inc, err := h.store.Get(r.Context(), id)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -126,7 +127,7 @@ func (h *IncidentHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inc, err := h.store.Update(id, req.Title, req.Severity, req.Status)
+	inc, err := h.store.Update(r.Context(), id, req.Title, req.Severity, req.Status)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -142,7 +143,7 @@ func (h *IncidentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.Delete(id); err != nil {
+	if err := h.store.Delete(r.Context(), id); err != nil {
 		h.storeError(w, err)
 		return
 	}
