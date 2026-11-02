@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"opspilot/internal/cache"
 	"opspilot/internal/config"
 	"opspilot/internal/handler"
 	"opspilot/internal/middleware"
@@ -19,7 +20,11 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("invalid config", "error", err)
+		os.Exit(1)
+	}
 
 	// LOG_LEVEL accepts debug, info, warn or error. An unknown value falls back to info.
 	var level slog.Level
@@ -54,12 +59,41 @@ func main() {
 		incidentStore = pg
 	}
 
-	slog.Info("config loaded", "port", cfg.Port, "log_level", level.String())
+	// Redis is optional: with REDIS_URL set we get caching and alert de-duplication.
+	var dedup *cache.Deduper
+	if cfg.RedisURL == "" {
+		slog.Warn("REDIS_URL not set, caching and alert de-duplication are disabled")
+	} else {
+		connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		rdb, err := cache.NewRedisClient(connectCtx, cfg.RedisURL)
+		cancel()
+		if err != nil {
+			slog.Error("could not connect to redis", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			rdb.Close()
+			slog.Info("redis connection closed")
+		}()
+		incidentStore = store.NewCachedStore(incidentStore, rdb, cfg.CacheTTL)
+		dedup = cache.NewDeduper(rdb, cfg.DedupWindow)
+	}
 
-	h := handler.NewIncidentHandler(incidentStore)
+	slog.Info("config loaded",
+		"port", cfg.Port,
+		"log_level", level.String(),
+		"postgres_enabled", cfg.DatabaseURL != "",
+		"redis_enabled", cfg.RedisURL != "",
+		"cache_ttl", cfg.CacheTTL,
+		"dedup_window", cfg.DedupWindow,
+	)
+
+	incidents := handler.NewIncidentHandler(incidentStore)
+	alerts := handler.NewAlertHandler(incidentStore, dedup)
 
 	r := mux.NewRouter()
-	h.RegisterRoutes(r)
+	incidents.RegisterRoutes(r)
+	alerts.RegisterRoutes(r)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
@@ -85,5 +119,5 @@ func main() {
 		slog.Error("graceful shutdown failed", "error", err)
 	}
 	slog.Info("server stopped", "took", time.Since(start))
-	// deferred pg.Close() runs here and closes database connections
+	// deferred Close() calls run here: Redis first, then Postgres (reverse order of defer)
 }
