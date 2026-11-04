@@ -2,16 +2,15 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
-	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/pgx/v5/tracelog"
 
+	"opspilot/internal/event"
 	"opspilot/internal/model"
 )
 
@@ -24,12 +23,6 @@ func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, 
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
-	// Send every SQL query to our logger. They show up only when LOG_LEVEL=debug.
-	cfg.ConnConfig.Tracer = &tracelog.TraceLog{
-		Logger:   tracelog.LoggerFunc(logPgx),
-		LogLevel: tracelog.LogLevelInfo,
-	}
-
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
@@ -51,19 +44,14 @@ func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, 
 	return &PostgresStore{pool: pool}, nil
 }
 
+// Pool gives the outbox relay access to the same connection pool.
+func (s *PostgresStore) Pool() *pgxpool.Pool {
+	return s.pool
+}
+
 func (s *PostgresStore) Close() {
 	s.pool.Close()
 	slog.Info("postgres connection pool closed")
-}
-
-// logPgx turns pgx's query logs into slog DEBUG lines (sql, args, time, rows affected).
-// Query errors are also logged at DEBUG: the handler already logs them at ERROR.
-func logPgx(ctx context.Context, level tracelog.LogLevel, msg string, data map[string]any) {
-	attrs := []any{"pgx_level", level.String()}
-	for _, k := range slices.Sorted(maps.Keys(data)) {
-		attrs = append(attrs, k, data[k])
-	}
-	slog.DebugContext(ctx, "sql "+msg, attrs...)
 }
 
 const incidentColumns = "id, title, severity, status, created_at"
@@ -75,14 +63,27 @@ func scanIncident(row pgx.Row) (model.Incident, error) {
 	return inc, err
 }
 
+// Create inserts the incident and its "created" event in one transaction.
 func (s *PostgresStore) Create(ctx context.Context, title, severity string) (model.Incident, error) {
-	row := s.pool.QueryRow(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Incident{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) // undoes everything unless Commit succeeded; harmless after Commit
+
+	row := tx.QueryRow(ctx,
 		`INSERT INTO incidents (title, severity) VALUES ($1, $2) RETURNING `+incidentColumns,
 		title, severity)
 
 	inc, err := scanIncident(row)
 	if err != nil {
 		return model.Incident{}, fmt.Errorf("insert incident: %w", err)
+	}
+	if err := insertOutbox(ctx, tx, event.IncidentCreated, inc.ID, inc); err != nil {
+		return model.Incident{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.Incident{}, fmt.Errorf("commit: %w", err)
 	}
 	return inc, nil
 }
@@ -123,8 +124,15 @@ func (s *PostgresStore) List(ctx context.Context) ([]model.Incident, error) {
 	return list, nil
 }
 
+// Update changes the incident and records an "updated" event in one transaction.
 func (s *PostgresStore) Update(ctx context.Context, id int, title, severity, status string) (model.Incident, error) {
-	row := s.pool.QueryRow(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Incident{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	row := tx.QueryRow(ctx,
 		`UPDATE incidents SET title = $2, severity = $3, status = $4
 		 WHERE id = $1
 		 RETURNING `+incidentColumns,
@@ -137,16 +145,52 @@ func (s *PostgresStore) Update(ctx context.Context, id int, title, severity, sta
 	if err != nil {
 		return model.Incident{}, fmt.Errorf("update incident %d: %w", id, err)
 	}
+	if err := insertOutbox(ctx, tx, event.IncidentUpdated, inc.ID, inc); err != nil {
+		return model.Incident{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.Incident{}, fmt.Errorf("commit: %w", err)
+	}
 	return inc, nil
 }
 
+// Delete removes the incident and records a "deleted" event in one transaction.
 func (s *PostgresStore) Delete(ctx context.Context, id int) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM incidents WHERE id = $1`, id)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `DELETE FROM incidents WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("delete incident %d: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	if err := insertOutbox(ctx, tx, event.IncidentDeleted, id, map[string]int{"id": id}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// insertOutbox records an event inside the caller's transaction. Because the event and the
+// incident change commit together, an event can never be lost or published for a change
+// that didn't happen.
+func insertOutbox(ctx context.Context, tx pgx.Tx, eventType string, incidentID int, data any) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("marshal %s event: %w", eventType, err)
+	}
+	_, err = tx.Exec(ctx,
+		`INSERT INTO outbox (event_type, incident_id, payload) VALUES ($1, $2, $3)`,
+		eventType, incidentID, payload)
+	if err != nil {
+		return fmt.Errorf("insert %s event: %w", eventType, err)
 	}
 	return nil
 }

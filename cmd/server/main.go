@@ -16,6 +16,7 @@ import (
 	"opspilot/internal/config"
 	"opspilot/internal/handler"
 	"opspilot/internal/middleware"
+	"opspilot/internal/outbox"
 	"opspilot/internal/store"
 )
 
@@ -44,12 +45,13 @@ func main() {
 
 	// Choose the store: Postgres if DATABASE_URL is set, otherwise in-memory.
 	var incidentStore handler.IncidentStore
+	var pg *store.PostgresStore
 	if cfg.DatabaseURL == "" {
 		slog.Warn("DATABASE_URL not set, using in-memory store (data is lost on restart)")
 		incidentStore = store.NewMemoryStore()
 	} else {
 		connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		pg, err := store.NewPostgresStore(connectCtx, cfg.DatabaseURL)
+		pg, err = store.NewPostgresStore(connectCtx, cfg.DatabaseURL)
 		cancel()
 		if err != nil {
 			slog.Error("could not connect to postgres", "error", err)
@@ -79,12 +81,42 @@ func main() {
 		dedup = cache.NewDeduper(rdb, cfg.DedupWindow)
 	}
 
+	// The outbox relay needs Postgres (where events are saved) and Kafka (where they go).
+	var relayDone chan struct{}
+	switch {
+	case pg == nil:
+		slog.Warn("outbox relay disabled: needs postgres (the in-memory store doesn't record events)")
+	case len(cfg.KafkaBrokers) == 0:
+		slog.Warn("KAFKA_BROKERS not set, outbox relay disabled (events wait in the outbox table)")
+	default:
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := outbox.CheckKafka(checkCtx, cfg.KafkaBrokers)
+		cancel()
+		if err != nil {
+			slog.Error("could not connect to kafka", "error", err)
+			os.Exit(1)
+		}
+		writer := outbox.NewKafkaWriter(cfg.KafkaBrokers)
+		defer func() {
+			writer.Close()
+			slog.Info("kafka writer closed")
+		}()
+
+		relay := outbox.NewRelay(pg.Pool(), writer, cfg.OutboxPollInterval)
+		relayDone = make(chan struct{})
+		go func() {
+			defer close(relayDone)
+			relay.Run(ctx)
+		}()
+	}
+
 	slog.Info("config loaded",
 		"port", cfg.Port,
 		"log_level", level.String(),
 		"postgres_enabled", cfg.DatabaseURL != "",
 		"redis_enabled", cfg.RedisURL != "",
 		"cache_ttl", cfg.CacheTTL,
+		"kafka_enabled", len(cfg.KafkaBrokers) > 0,
 		"dedup_window", cfg.DedupWindow,
 	)
 
@@ -117,6 +149,9 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "error", err)
+	}
+	if relayDone != nil {
+		<-relayDone // ctx is already cancelled, so the relay is finishing its current batch
 	}
 	slog.Info("server stopped", "took", time.Since(start))
 	// deferred Close() calls run here: Redis first, then Postgres (reverse order of defer)
