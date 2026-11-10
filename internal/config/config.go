@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +18,8 @@ type Config struct {
 
 	KafkaBrokers       []string
 	OutboxPollInterval time.Duration
+
+	NotifierConsumers int // how many consumers the notifier runs; each writes consumer_<n>_hello.txt
 }
 
 func Load() (Config, error) {
@@ -32,6 +35,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	consumers, err := getInt("NOTIFIER_CONSUMERS", 3)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		Port:        getEnv("PORT", "8087"),
@@ -43,6 +50,8 @@ func Load() (Config, error) {
 
 		KafkaBrokers:       getList("KAFKA_BROKERS"),
 		OutboxPollInterval: pollInterval,
+
+		NotifierConsumers: consumers,
 	}, nil
 }
 
@@ -64,6 +73,19 @@ func getDuration(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s=%q is not a valid duration (use e.g. 30s, 5m): %w", key, v, err)
 	}
 	return d, nil
+}
+
+// getInt reads a positive whole number.
+func getInt(key string, fallback int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s=%q must be a whole number of at least 1", key, v)
+	}
+	return n, nil
 }
 
 // getList reads a comma-separated value like "host1:9092,host2:9092".

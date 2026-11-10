@@ -14,6 +14,7 @@ import (
 
 	"opspilot/internal/cache"
 	"opspilot/internal/config"
+	"opspilot/internal/event"
 	"opspilot/internal/handler"
 	"opspilot/internal/middleware"
 	"opspilot/internal/outbox"
@@ -90,7 +91,7 @@ func main() {
 		slog.Warn("KAFKA_BROKERS not set, outbox relay disabled (events wait in the outbox table)")
 	default:
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := outbox.CheckKafka(checkCtx, cfg.KafkaBrokers)
+		err := outbox.CheckKafka(checkCtx, cfg.KafkaBrokers, event.Topic)
 		cancel()
 		if err != nil {
 			slog.Error("could not connect to kafka", "error", err)

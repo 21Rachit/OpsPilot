@@ -8,6 +8,9 @@ import (
 // Topic is the Kafka topic all incident events are published to.
 const Topic = "incident.events"
 
+// DLQTopic receives events a consumer gave up on, so they can be inspected and replayed.
+const DLQTopic = "incident.events.dlq"
+
 // Event types.
 const (
 	IncidentCreated = "incident.created"

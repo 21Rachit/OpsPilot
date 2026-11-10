@@ -23,18 +23,20 @@ func NewKafkaWriter(brokers []string) *kafka.Writer {
 	}
 }
 
-// CheckKafka connects to the first broker and confirms the topic exists, so we fail fast.
-func CheckKafka(ctx context.Context, brokers []string) error {
+// CheckKafka connects to the first broker and confirms the topics exist, so we fail fast.
+func CheckKafka(ctx context.Context, brokers []string, topics ...string) error {
 	conn, err := kafka.DialContext(ctx, "tcp", brokers[0])
 	if err != nil {
 		return fmt.Errorf("dial kafka %s: %w", brokers[0], err)
 	}
 	defer conn.Close()
 
-	partitions, err := conn.ReadPartitions(event.Topic)
-	if err != nil {
-		return fmt.Errorf("read partitions of topic %q (did you create it?): %w", event.Topic, err)
+	for _, topic := range topics {
+		partitions, err := conn.ReadPartitions(topic)
+		if err != nil {
+			return fmt.Errorf("read partitions of topic %q (did you create it?): %w", topic, err)
+		}
+		slog.Info("connected to kafka", "brokers", brokers, "topic", topic, "partitions", len(partitions))
 	}
-	slog.Info("connected to kafka", "brokers", brokers, "topic", event.Topic, "partitions", len(partitions))
 	return nil
 }
