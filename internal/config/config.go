@@ -19,7 +19,14 @@ type Config struct {
 	KafkaBrokers       []string
 	OutboxPollInterval time.Duration
 
-	NotifierConsumers int // how many consumers the notifier runs; each writes consumer_<n>_hello.txt
+	NotifierConsumers int           // how many consumers the notifier runs; each writes consumer_<n>_hello.txt
+	GatewayPort       string        // where the gateway listens
+	UpstreamURL       string        // where the gateway forwards requests (the OpsPilot server)
+	JWTSecret         string        // signs and verifies tokens; keep it secret, at least 32 characters
+	TokenTTL          time.Duration // how long a token stays valid
+	RateLimit         int           // requests each user may make per RateLimitWindow
+	LoginRateLimit    int           // login attempts each client IP may make per RateLimitWindow
+	RateLimitWindow   time.Duration
 }
 
 func Load() (Config, error) {
@@ -39,6 +46,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	tokenTTL, err := getDuration("TOKEN_TTL", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimit, err := getInt("RATE_LIMIT", 60)
+	if err != nil {
+		return Config{}, err
+	}
+	loginRateLimit, err := getInt("LOGIN_RATE_LIMIT", 5)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimitWindow, err := getDuration("RATE_LIMIT_WINDOW", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		Port:        getEnv("PORT", "8087"),
@@ -52,6 +75,13 @@ func Load() (Config, error) {
 		OutboxPollInterval: pollInterval,
 
 		NotifierConsumers: consumers,
+		GatewayPort:       getEnv("GATEWAY_PORT", "8082"),
+		UpstreamURL:       getEnv("UPSTREAM_URL", "http://localhost:8087"),
+		JWTSecret:         os.Getenv("JWT_SECRET"),
+		TokenTTL:          tokenTTL,
+		RateLimit:         rateLimit,
+		LoginRateLimit:    loginRateLimit,
+		RateLimitWindow:   rateLimitWindow,
 	}, nil
 }
 
