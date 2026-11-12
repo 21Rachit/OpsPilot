@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+// The package name is used inside protobuf. "v1" lets you add a v2 later
+// without breaking clients that still use v1.
+package opspilot.incident.v1;
+
+// Where the generated Go code goes, and the Go package name it gets.
+option go_package = "opspilot/gen/incident/v1;incidentv1";
+
+import "google/protobuf/timestamp.proto";
+
+// IncidentService has the same operations as the /incidents HTTP routes.
+service IncidentService {
+  rpc CreateIncident(CreateIncidentRequest) returns (Incident);
+  rpc GetIncident(GetIncidentRequest) returns (Incident);
+  rpc ListIncidents(ListIncidentsRequest) returns (ListIncidentsResponse);
+  rpc UpdateIncident(UpdateIncidentRequest) returns (Incident);
+  rpc DeleteIncident(DeleteIncidentRequest) returns (DeleteIncidentResponse);
+}
+
+message Incident {
+  int64 id = 1;
+  string title = 2;
+  string severity = 3; // low, medium, high, critical
+  string status = 4;   // open, acknowledged, resolved
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message CreateIncidentRequest {
+  string title = 1;
+  string severity = 2;
+}
+
+message GetIncidentRequest {
+  int64 id = 1;
+}
+
+message ListIncidentsRequest {}
+
+message ListIncidentsResponse {
+  repeated Incident incidents = 1; // "repeated" means a list
+}
+
+message UpdateIncidentRequest {
+  int64 id = 1;
+  string title = 2;
+  string severity = 3;
+  string status = 4;
+}
+
+message DeleteIncidentRequest {
+  int64 id = 1;
+}
+
+message DeleteIncidentResponse {}

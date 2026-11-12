@@ -10,6 +10,7 @@ import (
 
 type Config struct {
 	Port        string
+	GRPCPort    string // where the server accepts gRPC calls (the gateway uses it)
 	DatabaseURL string
 	LogLevel    string // debug, info, warn, error
 	RedisURL    string
@@ -65,6 +66,7 @@ func Load() (Config, error) {
 
 	return Config{
 		Port:        getEnv("PORT", "8087"),
+		GRPCPort:    getEnv("GRPC_PORT", "9090"),
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		LogLevel:    getEnv("LOG_LEVEL", "info"),
 		RedisURL:    os.Getenv("REDIS_URL"),

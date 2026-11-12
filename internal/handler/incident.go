@@ -48,16 +48,7 @@ type incidentRequest struct {
 }
 
 func (req incidentRequest) validate(checkStatus bool) error {
-	if req.Title == "" {
-		return errors.New("title is required")
-	}
-	if !model.ValidSeverities[req.Severity] {
-		return errors.New("severity must be low, medium, high or critical")
-	}
-	if checkStatus && !model.ValidStatuses[req.Status] {
-		return errors.New("status must be open, acknowledged or resolved")
-	}
-	return nil
+	return model.Validate(req.Title, req.Severity, req.Status, checkStatus)
 }
 
 func (h *IncidentHandler) Create(w http.ResponseWriter, r *http.Request) {

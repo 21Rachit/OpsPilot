@@ -2,21 +2,26 @@
 
 An incident-tracking REST API written in Go, built step by step as a learning project.
 
-OpsPilot will eventually become an AI-powered incident response copilot, with RAG and an MCP server. It currently covers **Step 4**:
+OpsPilot will eventually become an AI-powered incident response copilot, with RAG and an MCP server. It currently covers **Step 5**:
 
 - CRUD operations on incidents, stored in **PostgreSQL**
 - A **Redis** cache in front of `GET /incidents/{id}`
 - An **alert webhook** (`POST /alerts`) that de-duplicates repeated alerts with Redis
 - **Kafka events** for every incident change, published reliably with the **transactional outbox** pattern
 - A separate **notifier** service that consumes those events with a consumer group, retries, a dead-letter queue and duplicate detection
+- An **API gateway** in front of the server, with JWT login, role-based access and Redis rate limiting
+- A **gRPC API** for incidents, next to the HTTP one, defined by a `.proto` contract
 - Structured logging and graceful shutdown
 
-The repo builds two programs:
+The repo builds three programs:
 
 | Program | Command | What it does |
 |---|---|---|
-| Server | `go run ./cmd/server` | The REST API, plus the outbox relay that publishes events to Kafka (the **producer**) |
+| Server | `go run ./cmd/server` | The REST API on `:8087` and the gRPC API on `:9090`, plus the outbox relay that publishes events to Kafka (the **producer**) |
 | Notifier | `go run ./cmd/notifier` | Reads the events from Kafka and writes one line per event to a file (the **consumer**) |
+| Gateway | `go run ./cmd/gateway` | The front door on `:8082`: checks the token, role and rate limit, then forwards the request to the server |
+
+A separate repo, **`opspilot-client`**, is a command-line client for the gRPC API. It shares only a copy of the `.proto` file with this repo. See [gRPC API](#grpc-api).
 
 All of the server's backing services are optional. Without `DATABASE_URL` the server uses an in-memory store. Without `REDIS_URL`, caching and de-duplication are switched off. Without `KAFKA_BROKERS`, events are still recorded in the outbox table but aren't published. The notifier needs both `DATABASE_URL` and `KAFKA_BROKERS`.
 
@@ -25,6 +30,8 @@ All of the server's backing services are optional. Without `DATABASE_URL` the se
 - Go 1.26.5 or newer (see `go.mod`)
 - Docker, to run PostgreSQL, Redis and Kafka
 - `curl`, for calling the API
+- Only if you change `proto/`: `protoc` and the Go plugins, to regenerate `gen/` (see [Changing the contract](#changing-the-contract))
+- Optional: `grpcurl` (`brew install grpcurl`), to call the gRPC API by hand
 
 ## Quick start
 
@@ -66,9 +73,13 @@ go run ./cmd/server
 
 # 8. run the notifier (terminal 2)
 go run ./cmd/notifier
+
+# 9. run the gateway (terminal 3); the secret signs login tokens
+export JWT_SECRET=my-local-dev-secret-at-least-32-chars-long
+go run ./cmd/gateway
 ```
 
-The server listens on **http://localhost:8087**. On startup you should see:
+The server listens on **http://localhost:8087** (HTTP) and **localhost:9090** (gRPC). On startup you should see:
 
 ```
 level=INFO msg="connected to postgres" host=localhost port=5432 database=opspilot user=opspilot max_conns=14
@@ -76,7 +87,16 @@ level=INFO msg="connected to redis" addr=localhost:6379 db=0 pool_size=140 dial_
 level=INFO msg="connected to kafka" brokers=[localhost:9092] topic=incident.events partitions=3
 level=INFO msg="config loaded" port=8087 log_level=INFO postgres_enabled=true redis_enabled=true cache_ttl=1m0s kafka_enabled=true dedup_window=5m0s
 level=INFO msg="outbox relay started" interval=1s batch_size=100
+level=INFO msg="gRPC server starting" addr=[::]:9090
 level=INFO msg="OpsPilot starting" addr=http://localhost:8087
+```
+
+The gateway prints:
+
+```
+level=INFO msg="connected to redis" addr=localhost:6379 ...
+level=INFO msg="rate limiting enabled" per_user=60 login_per_ip=5 window=1m0s
+level=INFO msg="gateway starting" addr=http://localhost:8082 upstream=http://localhost:8087 token_ttl=15m0s
 ```
 
 The notifier prints:
@@ -110,22 +130,30 @@ All settings come from environment variables.
 |---|---|---|
 | `DATABASE_URL` | *(empty)* | PostgreSQL connection string, `postgres://USER:PASSWORD@HOST:PORT/DB?sslmode=disable`. Empty means use the in-memory store |
 | `REDIS_URL` | *(empty)* | Redis connection string, `redis://HOST:PORT/DB`. Empty means no caching and no alert de-duplication |
-| `PORT` | `8087` | HTTP listen port |
+| `PORT` | `8087` | Server HTTP listen port |
+| `GRPC_PORT` | `9090` | Server gRPC listen port |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `debug` also prints cache hits and misses, and dedup steps |
 | `CACHE_TTL` | `60s` | How long an incident stays in the Redis cache |
 | `DEDUP_WINDOW` | `5m` | How long repeats of the same alert are treated as duplicates |
 | `KAFKA_BROKERS` | *(empty)* | Comma-separated Kafka brokers, for example `localhost:9092` or `k1:9092,k2:9092`. Empty means the outbox relay is off. It also needs `DATABASE_URL` |
 | `OUTBOX_POLL_INTERVAL` | `1s` | How often the relay checks the outbox table for new events |
 | `NOTIFIER_CONSUMERS` | `3` | Notifier only. How many consumers it runs. Each one writes `out/consumer_<n>_hello.txt` |
+| `GATEWAY_PORT` | `8082` | Gateway only. Where the gateway listens |
+| `UPSTREAM_URL` | `http://localhost:8087` | Gateway only. The server the gateway forwards requests to |
+| `JWT_SECRET` | *(empty)* | Gateway only. **Required**, at least 32 characters. Signs and verifies login tokens. Every gateway copy must use the same value, and changing it logs everyone out |
+| `TOKEN_TTL` | `15m` | Gateway only. How long a login token stays valid |
+| `RATE_LIMIT` | `60` | Gateway only. Requests each user may make per `RATE_LIMIT_WINDOW` |
+| `LOGIN_RATE_LIMIT` | `5` | Gateway only. Login attempts each client IP may make per `RATE_LIMIT_WINDOW` |
+| `RATE_LIMIT_WINDOW` | `1m` | Gateway only. The time window both limits count over |
 
-The notifier reads `DATABASE_URL`, `KAFKA_BROKERS`, `LOG_LEVEL` and `NOTIFIER_CONSUMERS`, and ignores the rest.
+The notifier reads `DATABASE_URL`, `KAFKA_BROKERS`, `LOG_LEVEL` and `NOTIFIER_CONSUMERS`, and ignores the rest. The gateway reads `REDIS_URL` (for rate limits; without it, limits are off), `LOG_LEVEL` and the `GATEWAY_PORT` … `RATE_LIMIT_WINDOW` settings.
 
-Durations use Go syntax: `30s`, `5m`, `1h`. An invalid value (for example `CACHE_TTL=abc` or `NOTIFIER_CONSUMERS=0`) stops the program at startup with an `invalid config` error.
+Durations use Go syntax: `30s`, `5m`, `1h`. An invalid value (for example `CACHE_TTL=abc`, `NOTIFIER_CONSUMERS=0` or a short `JWT_SECRET`) stops the program at startup with an `invalid config` error.
 
 ## Build and checks
 
 ```bash
-go mod download   # download dependencies (gorilla/mux, pgx, go-redis, kafka-go)
+go mod download   # download dependencies (gorilla/mux, pgx, go-redis, kafka-go, golang-jwt, bcrypt, grpc)
 go build ./...    # compile every package
 go vet ./...      # static checks
 ```
@@ -148,7 +176,7 @@ docker exec -it opspilot-kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --property print.key=true --property print.partition=true --property print.headers=true
 ```
 
-To test the notifier, see [Notifier → Checking it works](#checking-it-works).
+To test the notifier, see [Notifier → Checking it works](#checking-it-works). To test the gateway, see [Gateway → Trying it](#trying-it). To test the gRPC API, see [gRPC API → Calling it](#calling-it).
 
 ## API
 
@@ -427,6 +455,155 @@ Scenarios to try:
 
 `--reset-offsets` only works while no consumer in the group is running.
 
+## Gateway
+
+The gateway (`cmd/gateway`, port `8082`) is the single entry point for clients. It decides **who** you are, **what** you may do and **how often**, then forwards the request to the server with `httputil.ReverseProxy`. The server itself has no security code.
+
+```
+POST /login      → [login limit per IP] → check password → JWT
+everything else  → RequireAuth (401) → [user limit] (429) → RequireRole (403) → proxy → server :8087
+```
+
+### Login and tokens (JWT)
+
+`POST /login {"username":"bob","password":"password"}` returns `{"access_token":"eyJ...","token_type":"Bearer","expires_in":900}`. Every other request must send `Authorization: Bearer <token>`.
+
+- Passwords are checked with **bcrypt**. An unknown username still runs bcrypt against a dummy hash, so both kinds of failed login take the same time and don't reveal which usernames exist.
+- The token is signed with `JWT_SECRET` using **HS256**. The gateway checks the signature, the issuer and the expiry, and only accepts HS256, so a token with `"alg":"none"` is rejected.
+- The payload is only base64-encoded, not encrypted. It holds `sub` (username), `role`, `iss`, `iat` and `exp`.
+- The gateway removes any `X-User` and `X-User-Role` headers the client sent, then sets them from the token before forwarding.
+
+Demo users, all with the password `password`. They live in memory in `internal/auth/users.go`:
+
+| User | Role | GET | POST / PUT / PATCH | DELETE |
+|---|---|---|---|---|
+| `alice` | `viewer` | ✅ | ❌ 403 | ❌ 403 |
+| `bob` | `responder` | ✅ | ✅ | ❌ 403 |
+| `carol` | `admin` | ✅ | ✅ | ✅ |
+
+The role needed depends only on the HTTP method (`internal/gateway/rbac.go`). Any other method, such as `OPTIONS`, needs `admin`, so anything unplanned is denied by default.
+
+### Rate limits
+
+Fixed-window counters in Redis: `INCR` and `EXPIRE` run together in `MULTI/EXEC`, on the key `ratelimit:<limiter>:<who>:<window start>`.
+
+| Limiter | Counts per | Default |
+|---|---|---|
+| `user` | logged-in user | `RATE_LIMIT=60` per `RATE_LIMIT_WINDOW=1m` |
+| `login` | client IP (`RemoteAddr`; `X-Forwarded-For` is ignored, as clients can fake it) | `LOGIN_RATE_LIMIT=5` per window |
+
+Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`. Over the limit, the answer is `429` with `Retry-After`. If Redis goes down, requests are allowed (fail open).
+
+### Status codes
+
+| Code | Meaning |
+|---|---|
+| `401` | No token, a bad or expired token, or a wrong username or password |
+| `403` | Valid token, but the role isn't allowed to do this |
+| `429` | Over the rate limit |
+| `502` | The server is down (`{"error":"upstream unavailable"}`) |
+| anything else | Whatever the server answered |
+
+### Trying it
+
+```bash
+G=localhost:8082
+login() { curl -s -X POST $G/login -d "{\"username\":\"$1\",\"password\":\"password\"}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'; }
+BOB=$(login bob); ALICE=$(login alice)
+
+curl -i $G/incidents                                                    # 401, no token
+curl -i $G/incidents -H "Authorization: Bearer $BOB"                     # 200
+curl -i -X POST $G/incidents -H "Authorization: Bearer $ALICE" \
+  -d '{"title":"x","severity":"low"}'                                    # 403, viewer
+echo $BOB | cut -d. -f2 | base64 -d 2>/dev/null; echo                    # the token's payload
+docker exec opspilot-redis redis-cli --scan --pattern 'ratelimit:*'     # the counters
+```
+
+To hit a limit quickly, start the gateway with `RATE_LIMIT=5 RATE_LIMIT_WINDOW=30s`.
+
+Port `8087` still works without a token. In production, only the gateway would be reachable from outside.
+
+## gRPC API
+
+The server also serves incidents over **gRPC** on port `9090`, from the same store as the HTTP API. An incident created over gRPC goes through the same cache, outbox and Kafka events.
+
+```
+                    ┌── HTTP :8087 ── internal/handler/incident.go ────┐
+OpsPilot server ────┤                                                  ├── store (cache → Postgres + outbox)
+                    └── gRPC :9090 ── internal/grpcserver/incident.go ─┘
+```
+
+Both APIs check input with the same `model.Validate`, so the rules can't drift apart.
+
+### The contract
+
+`proto/incident/v1/incident.proto` defines the service:
+
+| RPC | Request | Response | HTTP equivalent |
+|---|---|---|---|
+| `CreateIncident` | `title`, `severity` | `Incident` | `POST /incidents` |
+| `GetIncident` | `id` | `Incident` | `GET /incidents/{id}` |
+| `ListIncidents` | *(none)* | `incidents` (a list) | `GET /incidents` |
+| `UpdateIncident` | `id`, `title`, `severity`, `status` | `Incident` | `PUT /incidents/{id}` |
+| `DeleteIncident` | `id` | *(empty)* | `DELETE /incidents/{id}` |
+
+`Incident` has `id` (int64), `title`, `severity`, `status` and `created_at` (`google.protobuf.Timestamp`).
+
+Errors use gRPC status codes instead of HTTP ones:
+
+| Situation | gRPC code | HTTP API |
+|---|---|---|
+| Bad input (missing title, bad severity or status, `id <= 0`) | `InvalidArgument` | `400` |
+| Incident doesn't exist | `NotFound` | `404` |
+| Unexpected error (details are logged, not returned) | `Internal` | `500` |
+
+The server registers **reflection**, so tools like `grpcurl` can list the services and methods without the `.proto` file.
+
+### Calling it
+
+```bash
+A=localhost:9090
+S=opspilot.incident.v1.IncidentService
+
+grpcurl -plaintext $A list                      # services on the server
+grpcurl -plaintext $A describe $S               # the 5 methods
+grpcurl -plaintext -d '{"title":"DNS latency high","severity":"high"}' $A $S/CreateIncident
+grpcurl -plaintext -d '{"id":1}' $A $S/GetIncident
+grpcurl -plaintext $A $S/ListIncidents
+grpcurl -plaintext -d '{"id":1,"title":"DNS latency high","severity":"critical","status":"resolved"}' $A $S/UpdateIncident
+grpcurl -plaintext -d '{"id":1}' $A $S/DeleteIncident
+```
+
+`-plaintext` means no TLS, which is fine on one machine. grpcurl prints int64 values as strings (`"id": "1"`) and times in UTC.
+
+Or use the separate **`opspilot-client`** repo, a command-line client with its own copy of the `.proto`:
+
+```bash
+cd ../opspilot-client
+OPSPILOT_USER=rachit go run . create "DNS latency high" high
+go run . list
+go run . get 1
+```
+
+The client sends its user as gRPC metadata (`x-user`). The server's log shows it as `user=rachit`, or `user=-` when there's none, as with grpcurl.
+
+### Changing the contract
+
+`gen/incident/v1/` is generated from the `.proto`. Never edit it by hand: change the `.proto`, then regenerate:
+
+```bash
+# once: brew install protobuf
+#       go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+#       go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+protoc --go_out=. --go_opt=module=opspilot \
+       --go-grpc_out=. --go-grpc_opt=module=opspilot \
+       proto/incident/v1/incident.proto
+```
+
+- Never change a field's number (`= 1`, `= 2`…) once it's in use. Protobuf sends the number, not the name, so changing it breaks every client.
+- A new RPC returns `Unimplemented` until you write it, because `IncidentServer` embeds `UnimplementedIncidentServiceServer`.
+- Copy the changed `.proto` to `opspilot-client` and regenerate there too.
+
 ## Database
 
 The schema lives in `migrations/`. `001_create_incidents.sql` creates **incidents**:
@@ -479,7 +656,7 @@ SELECT * FROM processed_events;
 
 ## Logging
 
-Both programs use Go's structured logger (`log/slog`) and write text logs to stdout. Set the level with `LOG_LEVEL`.
+All programs use Go's structured logger (`log/slog`) and write text logs to stdout. Set the level with `LOG_LEVEL`.
 
 | Source | Level | What it logs |
 |---|---|---|
@@ -501,6 +678,13 @@ Both programs use Go's structured logger (`log/slog`) and write text logs to std
 | `internal/notifier/consumer.go` | WARN | `attempt failed, retrying`; `fetch failed, retrying` (Kafka unreachable); commit failed; Postgres unavailable for the duplicate check |
 | `internal/notifier/consumer.go` | ERROR | `event moved to DLQ` (attempts, whether the error was permanent, the cause) |
 | `cmd/notifier/main.go` | INFO / ERROR | Config loaded (number of consumers), readers and DLQ writer closed; a consumer failed and the notifier is stopping |
+| `internal/grpcserver/logging.go` | INFO / WARN / ERROR | One `grpc request` line per call: method, user, code, duration. WARN for caller errors (`NotFound`, `InvalidArgument`), ERROR for ours (`Internal`) |
+| `internal/grpcserver/incident.go` | INFO / ERROR | Incident created, updated or deleted, with `api=grpc`; unexpected store errors |
+| `internal/gateway/auth.go` | INFO / WARN | `login succeeded` (username, role), `login failed`, `token rejected` (with the reason: invalid or expired) |
+| `internal/gateway/rbac.go` | WARN | `access denied` (user, role, the role needed, method, path) |
+| `internal/gateway/ratelimit.go` | WARN | `rate limit exceeded` (limiter, who, limit, retry after); `rate limiter unavailable, allowing request` (Redis down) |
+| `internal/gateway/proxy.go` | ERROR | `upstream unreachable`: the server is down |
+| `cmd/gateway/main.go` | INFO / WARN | Gateway start (port, upstream, token TTL), rate limiting enabled or disabled, shutdown |
 
 Every notifier log line carries `consumer_id`, so you can tell the consumers apart.
 
@@ -550,12 +734,30 @@ level=WARN msg="notifier: attempt failed, retrying" consumer_id=2 ... attempt=2 
 level=ERROR msg="notifier: event moved to DLQ" consumer_id=2 partition=1 offset=41 attempts=3 permanent=false error="..."
 ```
 
+A gRPC call that succeeds, then one for an incident that doesn't exist:
+
+```
+level=INFO msg="incident created" id=42 severity=high api=grpc
+level=INFO msg="grpc request" method=/opspilot.incident.v1.IncidentService/CreateIncident user=rachit code=OK duration=14.78ms
+level=WARN msg="grpc request" method=/opspilot.incident.v1.IncidentService/GetIncident user=rachit code=NotFound duration=39µs
+```
+
+`method` is the call's full name, `/<proto package>.<service>/<rpc>`. It's also the HTTP/2 path the call is sent to.
+
+In the gateway, a viewer trying to create an incident:
+
+```
+level=WARN msg="gateway: access denied" user=alice role=viewer required_role=responder method=POST path=/incidents
+level=WARN msg=request method=POST path=/incidents status=403 duration=...
+```
+
 ## Graceful shutdown
 
-On Ctrl+C (`SIGINT`) or `SIGTERM` (sent by Docker or Kubernetes), the server stops accepting new connections and waits up to 10 seconds for in-flight requests to finish. It then waits for the outbox relay to stop, and closes the Kafka writer, Redis and the database pool, in that order:
+On Ctrl+C (`SIGINT`) or `SIGTERM` (sent by Docker or Kubernetes), the server stops accepting new connections and waits up to 10 seconds for in-flight requests to finish. It then stops the gRPC server, waits for the outbox relay to stop, and closes the Kafka writer, Redis and the database pool, in that order:
 
 ```
 level=INFO msg="shutting down, finishing in-flight requests"
+level=INFO msg="grpc server stopped"
 level=INFO msg="outbox relay stopped"
 level=INFO msg="server stopped" took=1.02ms
 level=INFO msg="kafka writer closed"
@@ -563,7 +765,15 @@ level=INFO msg="redis connection closed"
 level=INFO msg="postgres connection pool closed"
 ```
 
-The relay must stop before the pool and writer are closed, because it uses both. If shutdown interrupts a batch, the batch is rolled back and sent on the next start.
+The relay must stop before the pool and writer are closed, because it uses both. If shutdown interrupts a batch, the batch is rolled back and sent on the next start. gRPC's `GracefulStop` has no timeout of its own, so if in-flight calls take longer than the 10 seconds, the server force-stops them (`grpc server forced to stop`).
+
+The gateway stops accepting requests, waits for in-flight ones, then closes Redis:
+
+```
+level=INFO msg="gateway shutting down"
+level=INFO msg="gateway stopped"
+level=INFO msg="redis connection closed"
+```
 
 The notifier stops all its consumers, then closes the readers (which leaves the consumer group), the DLQ writer and the database pool:
 
@@ -592,14 +802,24 @@ A message being retried at that moment isn't committed (`message will be redeliv
 | **Notifier:** a message isn't valid JSON | Goes straight to the DLQ, without retries |
 | **Notifier:** Postgres goes down while running | Events are still written, but duplicates can't be detected (fail open: a duplicate line is better than a missed one) |
 | **Notifier:** the DLQ can't be written | The message isn't committed, and the whole notifier exits so it can be restarted. Nothing is lost |
+| **Server:** the gRPC port is already in use | Logs `could not listen for grpc ... address already in use` and exits, before the HTTP server starts |
+| **Gateway:** `JWT_SECRET` missing or shorter than 32 characters | Logs `invalid config` and exits |
+| **Gateway:** Redis unreachable at startup | Logs `could not connect to redis` and exits. Without `REDIS_URL`, it starts with rate limits off |
+| **Gateway:** Redis goes down while running | Requests are allowed without limits (fail open). Limits come back by themselves |
+| **Gateway:** the server is down | `502 upstream unavailable`. Login still works, because the gateway handles `/login` itself |
 
 ## Project structure
 
 ```
 .
 ├── cmd/
-│   ├── server/main.go               # API entry point: config, logger, store choice, Redis, Kafka relay, HTTP server, graceful shutdown
-│   └── notifier/main.go             # consumer entry point: starts NOTIFIER_CONSUMERS consumers in one group, shared DLQ writer
+│   ├── server/main.go               # API entry point: config, logger, store choice, Redis, Kafka relay, HTTP and gRPC servers, graceful shutdown
+│   ├── notifier/main.go             # consumer entry point: starts NOTIFIER_CONSUMERS consumers in one group, shared DLQ writer
+│   └── gateway/main.go              # gateway entry point: builds the /login and API handler chains
+├── proto/incident/v1/incident.proto # the gRPC contract (source of truth)
+├── gen/incident/v1/                 # Go code generated from the .proto (don't edit by hand)
+│   ├── incident.pb.go               # message types: Incident, CreateIncidentRequest...
+│   └── incident_grpc.pb.go          # IncidentServiceServer interface, client, method routing
 ├── migrations/
 │   ├── 001_create_incidents.sql     # incidents table
 │   ├── 002_create_outbox.sql        # outbox table for events waiting to go to Kafka
@@ -607,7 +827,7 @@ A message being retried at that moment isn't committed (`message will be redeliv
 ├── out/                             # notifier output files (created at runtime, ignored by git)
 └── internal/
     ├── config/config.go             # reads all env vars (see Configuration)
-    ├── model/incident.go            # Incident struct and allowed severity/status values
+    ├── model/incident.go            # Incident struct, allowed severity/status values, Validate (shared by HTTP and gRPC)
     ├── event/event.go               # event types, topic and DLQ topic names, the Kafka message format
     ├── outbox/
     │   ├── kafka.go                 # Kafka producer and startup check (also used by the notifier)
@@ -626,7 +846,19 @@ A message being retried at that moment isn't committed (`message will be redeliv
     │   ├── incident.go              # /incidents routes, validation, status codes
     │   ├── alert.go                 # /alerts webhook
     │   └── response.go              # writeJSON / writeError helpers
-    └── middleware/logging.go        # per-request logging middleware
+    ├── grpcserver/
+    │   ├── incident.go              # implements IncidentService on the same store; errors → gRPC codes
+    │   └── logging.go               # interceptor: one log line per gRPC call
+    ├── auth/
+    │   ├── users.go                 # demo users, roles, bcrypt password check
+    │   ├── token.go                 # issue and verify HS256 JWTs
+    │   └── roles.go                 # role ranking (viewer < responder < admin)
+    ├── gateway/
+    │   ├── proxy.go                 # reverse proxy to the server, 502 when it's down
+    │   ├── auth.go                  # POST /login, RequireAuth middleware, claims in the context
+    │   ├── rbac.go                  # RequireRole: which role each HTTP method needs
+    │   └── ratelimit.go             # fixed-window rate limiter in Redis, per user or per IP
+    └── middleware/logging.go        # per-request logging middleware (server and gateway)
 ```
 
 **How a request flows:**
@@ -645,6 +877,12 @@ PUT /incidents/7 → ... → PostgresStore ─┬─ UPDATE incidents   ┐ one 
                          Notifier (separate process) ◀────────┘ → out/consumer_<n>_hello.txt
                                                                 → processed_events (Postgres)
                                                                 → incident.events.dlq (on failure)
+
+Through the gateway:
+DELETE /incidents/7 → gateway :8082 → Logging → RequireAuth → user limit → RequireRole (admin?) → proxy → server :8087
+
+Over gRPC:
+grpcurl / opspilot-client → :9090 → LoggingInterceptor → IncidentServer.DeleteIncident → CachedStore → PostgresStore
 ```
 
 The handlers depend on the `IncidentStore` interface, not on a concrete store. `main.go` builds the chain: first the base store (`PostgresStore` or `MemoryStore`), then, if `REDIS_URL` is set, it wraps it in `CachedStore`. The handlers pass the request's `context.Context` down, so if a client disconnects, its Redis and database calls are cancelled.
@@ -657,7 +895,12 @@ The handlers depend on the `IncidentStore` interface, not on a concrete store. `
 4. ✅ Kafka events
    - 4a. ✅ Transactional outbox and relay publishing to Kafka
    - 4b. ✅ Consumer service with retries, a dead-letter queue and idempotency
-5. API gateway: JWT auth, RBAC, rate limiting, gRPC
+5. ✅ API gateway and gRPC
+   - 5a. ✅ Gateway as a reverse proxy
+   - 5b. ✅ Login and JWT tokens
+   - 5c. ✅ Role-based access (RBAC)
+   - 5d. ✅ Rate limiting with Redis
+   - 5e. ✅ gRPC API (`.proto` contract, generated code, gRPC server) and a separate client repo
 6. pgvector embeddings and document ingestion
 7. RAG question answering with Claude
 8. MCP server exposing OpsPilot tools to AI agents
