@@ -28,6 +28,9 @@ type Config struct {
 	RateLimit         int           // requests each user may make per RateLimitWindow
 	LoginRateLimit    int           // login attempts each client IP may make per RateLimitWindow
 	RateLimitWindow   time.Duration
+	OllamaURL         string // where the Ollama server runs the embedding model
+	EmbeddingModel    string // which model turns text into vectors; must produce 768 numbers
+	EmbedderConsumers int    // how many consumers the embedder runs
 }
 
 func Load() (Config, error) {
@@ -63,6 +66,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	embedderConsumers, err := getInt("EMBEDDER_CONSUMERS", 1)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		Port:        getEnv("PORT", "8087"),
@@ -84,6 +91,9 @@ func Load() (Config, error) {
 		RateLimit:         rateLimit,
 		LoginRateLimit:    loginRateLimit,
 		RateLimitWindow:   rateLimitWindow,
+		OllamaURL:         getEnv("OLLAMA_URL", "http://localhost:11434"),
+		EmbeddingModel:    getEnv("EMBEDDING_MODEL", "nomic-embed-text"),
+		EmbedderConsumers: embedderConsumers,
 	}, nil
 }
 

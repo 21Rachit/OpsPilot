@@ -2,7 +2,7 @@
 
 An incident-tracking REST API written in Go, built step by step as a learning project.
 
-OpsPilot will eventually become an AI-powered incident response copilot, with RAG and an MCP server. It currently covers **Step 5**:
+OpsPilot will eventually become an AI-powered incident response copilot, with RAG and an MCP server. It currently covers **Step 6**:
 
 - CRUD operations on incidents, stored in **PostgreSQL**
 - A **Redis** cache in front of `GET /incidents/{id}`
@@ -11,24 +11,28 @@ OpsPilot will eventually become an AI-powered incident response copilot, with RA
 - A separate **notifier** service that consumes those events with a consumer group, retries, a dead-letter queue and duplicate detection
 - An **API gateway** in front of the server, with JWT login, role-based access and Redis rate limiting
 - A **gRPC API** for incidents, next to the HTTP one, defined by a `.proto` contract
+- **Semantic search** (`GET /search`) over incidents and Markdown runbooks, using embeddings from a local model (**Ollama**) stored in **pgvector**
 - Structured logging and graceful shutdown
 
-The repo builds three programs:
+The repo builds five programs:
 
 | Program | Command | What it does |
 |---|---|---|
 | Server | `go run ./cmd/server` | The REST API on `:8087` and the gRPC API on `:9090`, plus the outbox relay that publishes events to Kafka (the **producer**) |
-| Notifier | `go run ./cmd/notifier` | Reads the events from Kafka and writes one line per event to a file (the **consumer**) |
+| Notifier | `go run ./cmd/notifier` | Reads the events from Kafka and writes one line per event to a file (a **consumer**) |
+| Embedder | `go run ./cmd/embedder` | Reads the same events and stores a vector for each incident in `incident_embeddings` (another consumer) |
+| Ingest | `go run ./cmd/ingest` | A command you run, not a service: splits `runbooks/*.md` into sections and stores a vector for each in `runbook_chunks` |
 | Gateway | `go run ./cmd/gateway` | The front door on `:8082`: checks the token, role and rate limit, then forwards the request to the server |
 
 A separate repo, **`opspilot-client`**, is a command-line client for the gRPC API. It shares only a copy of the `.proto` file with this repo. See [gRPC API](#grpc-api).
 
-All of the server's backing services are optional. Without `DATABASE_URL` the server uses an in-memory store. Without `REDIS_URL`, caching and de-duplication are switched off. Without `KAFKA_BROKERS`, events are still recorded in the outbox table but aren't published. The notifier needs both `DATABASE_URL` and `KAFKA_BROKERS`.
+All of the server's backing services are optional. Without `DATABASE_URL` the server uses an in-memory store. Without `REDIS_URL`, caching and de-duplication are switched off. Without `KAFKA_BROKERS`, events are still recorded in the outbox table but aren't published. `/search` needs `DATABASE_URL`, and Ollama only when a search runs. The notifier and the embedder need both `DATABASE_URL` and `KAFKA_BROKERS`, and the embedder and ingest also need Ollama.
 
 ## Prerequisites
 
 - Go 1.26.5 or newer (see `go.mod`)
-- Docker, to run PostgreSQL, Redis and Kafka
+- Docker, to run PostgreSQL (with the pgvector extension), Redis and Kafka
+- [Ollama](https://ollama.com) (`brew install ollama`), to run the embedding model `nomic-embed-text` locally. Only for the embedder, ingest and `/search`
 - `curl`, for calling the API
 - Only if you change `proto/`: `protoc` and the Go plugins, to regenerate `gen/` (see [Changing the contract](#changing-the-contract))
 - Optional: `grpcurl` (`brew install grpcurl`), to call the gRPC API by hand
@@ -36,14 +40,14 @@ All of the server's backing services are optional. Without `DATABASE_URL` the se
 ## Quick start
 
 ```bash
-# 1. start PostgreSQL 17 (data kept in the opspilot-pgdata volume)
+# 1. start PostgreSQL 17 with pgvector (data kept in the opspilot-pgdata volume)
 docker run -d --name opspilot-postgres \
   -e POSTGRES_USER=opspilot \
   -e POSTGRES_PASSWORD=opspilot \
   -e POSTGRES_DB=opspilot \
   -p 5432:5432 \
   -v opspilot-pgdata:/var/lib/postgresql/data \
-  postgres:17
+  pgvector/pgvector:0.8.7-pg17-trixie
 
 # 2. start Redis 7
 docker run -d --name opspilot-redis -p 6379:6379 redis:7
@@ -77,7 +81,19 @@ go run ./cmd/notifier
 # 9. run the gateway (terminal 3); the secret signs login tokens
 export JWT_SECRET=my-local-dev-secret-at-least-32-chars-long
 go run ./cmd/gateway
+
+# 10. start Ollama and download the embedding model (once, about 270 MB)
+brew services start ollama
+ollama pull nomic-embed-text
+
+# 11. run the embedder (terminal 4)
+go run ./cmd/embedder
+
+# 12. load the runbooks (run again whenever a file in runbooks/ changes)
+go run ./cmd/ingest
 ```
+
+Steps 10–12 are only needed for `/search`. If you created `opspilot-postgres` from the plain `postgres:17` image in an earlier step, swap the image and keep the data: `docker rm -f opspilot-postgres`, run step 1 again (same volume), then step 5.
 
 The server listens on **http://localhost:8087** (HTTP) and **localhost:9090** (gRPC). On startup you should see:
 
@@ -113,6 +129,13 @@ level=INFO msg="notifier consumer started" consumer_id=3 topic=incident.events g
 
 The first time it runs, it also writes every event already in the topic, because a new consumer group starts from the oldest message.
 
+The embedder prints the same kind of lines, with its own group:
+
+```
+level=INFO msg="embedder config loaded" log_level=INFO consumers=1 ollama_url=http://localhost:11434 model=nomic-embed-text dims=768
+level=INFO msg="embedder consumer started" consumer_id=1 topic=incident.events group=opspilot-embedder
+```
+
 To manage the containers afterwards:
 
 ```bash
@@ -138,6 +161,9 @@ All settings come from environment variables.
 | `KAFKA_BROKERS` | *(empty)* | Comma-separated Kafka brokers, for example `localhost:9092` or `k1:9092,k2:9092`. Empty means the outbox relay is off. It also needs `DATABASE_URL` |
 | `OUTBOX_POLL_INTERVAL` | `1s` | How often the relay checks the outbox table for new events |
 | `NOTIFIER_CONSUMERS` | `3` | Notifier only. How many consumers it runs. Each one writes `out/consumer_<n>_hello.txt` |
+| `OLLAMA_URL` | `http://localhost:11434` | Server, embedder and ingest. Where Ollama listens |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Server, embedder and ingest. The model that turns text into vectors. It must return 768 numbers, to fit the `vector(768)` columns. All three programs must use the same model, because vectors from different models can't be compared |
+| `EMBEDDER_CONSUMERS` | `1` | Embedder only. How many consumers it runs. Ollama embeds one text at a time, so more consumers rarely help |
 | `GATEWAY_PORT` | `8082` | Gateway only. Where the gateway listens |
 | `UPSTREAM_URL` | `http://localhost:8087` | Gateway only. The server the gateway forwards requests to |
 | `JWT_SECRET` | *(empty)* | Gateway only. **Required**, at least 32 characters. Signs and verifies login tokens. Every gateway copy must use the same value, and changing it logs everyone out |
@@ -146,7 +172,7 @@ All settings come from environment variables.
 | `LOGIN_RATE_LIMIT` | `5` | Gateway only. Login attempts each client IP may make per `RATE_LIMIT_WINDOW` |
 | `RATE_LIMIT_WINDOW` | `1m` | Gateway only. The time window both limits count over |
 
-The notifier reads `DATABASE_URL`, `KAFKA_BROKERS`, `LOG_LEVEL` and `NOTIFIER_CONSUMERS`, and ignores the rest. The gateway reads `REDIS_URL` (for rate limits; without it, limits are off), `LOG_LEVEL` and the `GATEWAY_PORT` … `RATE_LIMIT_WINDOW` settings.
+The notifier reads `DATABASE_URL`, `KAFKA_BROKERS`, `LOG_LEVEL` and `NOTIFIER_CONSUMERS`, and ignores the rest. The embedder reads the same plus `OLLAMA_URL`, `EMBEDDING_MODEL` and `EMBEDDER_CONSUMERS`. Ingest reads `DATABASE_URL`, `LOG_LEVEL`, `OLLAMA_URL` and `EMBEDDING_MODEL`. The gateway reads `REDIS_URL` (for rate limits; without it, limits are off), `LOG_LEVEL` and the `GATEWAY_PORT` … `RATE_LIMIT_WINDOW` settings.
 
 Durations use Go syntax: `30s`, `5m`, `1h`. An invalid value (for example `CACHE_TTL=abc`, `NOTIFIER_CONSUMERS=0` or a short `JWT_SECRET`) stops the program at startup with an `invalid config` error.
 
@@ -176,7 +202,7 @@ docker exec -it opspilot-kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --property print.key=true --property print.partition=true --property print.headers=true
 ```
 
-To test the notifier, see [Notifier → Checking it works](#checking-it-works). To test the gateway, see [Gateway → Trying it](#trying-it). To test the gRPC API, see [gRPC API → Calling it](#calling-it).
+To test the notifier, see [Notifier → Checking it works](#checking-it-works). To test the gateway, see [Gateway → Trying it](#trying-it). To test search, see [Semantic search → Trying it](#trying-search). To test the gRPC API, see [gRPC API → Calling it](#calling-it).
 
 ## API
 
@@ -211,6 +237,14 @@ The payload is a simplified format for learning. Real Alertmanager payloads are 
 - `{id}` must be numeric. Non-numeric IDs never reach a handler: gorilla/mux answers with a plain-text `404`.
 
 Errors come back as JSON: `{"error": "title is required"}`. A database failure returns `500`.
+
+### Search
+
+| Method | Path | Query | Success | Errors |
+|---|---|---|---|---|
+| `GET` | `/search` | `q` (required, at most 500 characters), `limit` (1–20, default 5) | `200` `{"query","model","incidents":[...],"runbooks":[...]}`, best match first | `400`, `503` when the embedding model is unreachable |
+
+Each hit has a `score` from 0 to 1 (higher means closer in meaning). See [Semantic search](#semantic-search-embeddings--pgvector).
 
 ### Example requests
 
@@ -359,7 +393,7 @@ Published rows are kept, which makes testing easier. A production system would d
 
 ## Notifier (Kafka consumer)
 
-The notifier (`cmd/notifier`) is a separate program that reacts to incident events. The server doesn't know it exists. For each event it appends a line to a file, standing in for a real action such as sending a Slack message:
+The notifier (`cmd/notifier`) is a separate program that reacts to incident events. The server doesn't know it exists. The consumer loop described below (consumer group, duplicate check, retries, DLQ, commit) lives in `internal/consumer` and is shared with the [embedder](#embedder): each service only supplies the function that handles one event. For each event it appends a line to a file, standing in for a real action such as sending a Slack message:
 
 ```
 hello i am a file and consumes from partition 1 with event id 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed
@@ -407,6 +441,7 @@ FetchMessage (doesn't commit)
   |---|---|
   | `dlq_error` | `append line: open out/consumer_2_hello.txt: permission denied` |
   | `dlq_attempts` | `3` (`0` for a message that couldn't be decoded) |
+  | `dlq_consumer` | `notifier` or `embedder`: which service gave up on it (both share one DLQ topic) |
   | `original_topic` | `incident.events` |
   | `original_partition` | `1` |
   | `original_offset` | `42` |
@@ -454,6 +489,85 @@ Scenarios to try:
 | Scaling | `NOTIFIER_CONSUMERS=2 go run ./cmd/notifier`, or `=4` | With 2, one file has two partitions. With 4, only 3 files are written |
 
 `--reset-offsets` only works while no consumer in the group is running.
+
+## Semantic search (embeddings + pgvector)
+
+Keyword search fails when people use different words: "login is slow in Europe" shares no words with an incident titled "DNS latency high in eu-west". Semantic search compares **meaning** instead:
+
+1. An **embedding model** turns a text into a list of 768 numbers (a **vector**). Texts with similar meaning get vectors that point in similar directions. OpsPilot uses `nomic-embed-text`, running locally in Ollama, so no data leaves your machine.
+2. The vectors are stored in Postgres with the **pgvector** extension (column type `vector(768)`).
+3. A search embeds the question and asks Postgres for the nearest vectors with the `<=>` (cosine distance) operator. An **HNSW index** makes this fast without comparing against every row.
+
+`nomic-embed-text` expects a prefix that says what a text is for: stored texts are embedded as `search_document: ...` and questions as `search_query: ...`. Both are added in `internal/embedding`, so callers never write them.
+
+This is the retrieval half of RAG. Step 7 will pass the search results to Claude to write an answer.
+
+### Embedder
+
+The embedder (`cmd/embedder`) is a Kafka consumer in group **`opspilot-embedder`**, using the same consumer loop as the notifier. For each event:
+
+| Event | What it does |
+|---|---|
+| `incident.created`, `incident.updated` | Builds the text `Incident: <title>\nSeverity: ...\nStatus: ...`, embeds it and upserts the row in `incident_embeddings`. If the text and model haven't changed, the existing vector is kept and Ollama isn't called |
+| `incident.deleted` | Deletes the row (usually already gone, through `ON DELETE CASCADE`) |
+| `created` for an incident that was deleted since | The insert hits the foreign key (`23503`), and the event is skipped |
+
+At startup it embeds the sentence `startup check`, so a stopped Ollama or a missing model stops it right away with a clear message, instead of sending every event to the DLQ. Ollama being down while it runs counts as a temporary error: the event is retried, then goes to the DLQ.
+
+Incidents created before Kafka existed (in Steps 2–3) have no event, so they have no vector until they're updated.
+
+### Runbook ingest
+
+Runbooks are Markdown files in `runbooks/`. They change rarely, so `cmd/ingest` is a command you run (by hand or from CI), not a service:
+
+```bash
+go run ./cmd/ingest            # ingest ./runbooks
+go run ./cmd/ingest -dry-run   # only show how each file is split; needs no database or Ollama
+go run ./cmd/ingest -force     # re-embed every file, even unchanged ones (after changing the chunking)
+go run ./cmd/ingest -dir path  # another folder
+```
+
+- **Chunking.** A whole runbook as one vector would blur several topics together. Each file is split into sections at its `##` (and deeper) headings, and a section longer than about 1000 characters is split again at blank lines. Lines inside ```` ``` ```` code blocks are never treated as headings, so a `# comment` in a bash block stays in its section.
+- **Context.** A chunk like `1. Run df -h` means little on its own, so the text that gets embedded starts with the runbook title and section: `Runbook: Disk full\nSection: Fix > Free space quickly\n\n...`.
+- **Unchanged files are skipped.** Each row stores the file's SHA-256 hash and the model. A file with the same hash and model as last time isn't embedded again.
+- **A changed file is replaced in one transaction**: its old chunks are deleted and the new ones inserted together, so a search never sees half of each, and a file that shrank doesn't leave old chunks behind. All chunks are embedded before the transaction starts.
+- **Deleted files are removed.** Chunks of files that are no longer in the folder are deleted, but only for that folder. An empty or missing folder is refused, because otherwise every runbook would count as deleted.
+- One failing file is logged and skipped, and its old chunks stay. The exit code is `1` if anything failed.
+
+### Search
+
+`GET /search?q=...` (see [API → Search](#search)) embeds the question once, then runs two queries: the nearest incidents (joined to `incidents`, so titles and statuses are current) and the nearest runbook chunks. Only vectors made by the current `EMBEDDING_MODEL` are compared. Each hit's `score` is `1 - cosine distance`.
+
+Vector search always returns the nearest rows, even when nothing is actually close. A question about a full disk still returns some DNS incidents if there are no disk incidents, just with lower scores (around 0.55 instead of 0.7).
+
+The server has no Ollama startup check: search is one feature among many, so if Ollama is down, `/search` returns `503` and everything else keeps working. Through the gateway, `/search` needs the `viewer` role, like every `GET`. The query text itself isn't logged, only its length.
+
+### Trying search
+
+```bash
+alias sql='docker exec opspilot-postgres psql -U opspilot -d opspilot -c'
+
+# log in through the gateway as a viewer and keep the token (see Gateway → Trying it)
+TOKEN=...
+s() { curl -s -G localhost:8082/search -H "Authorization: Bearer $TOKEN" --data-urlencode "q=$1" --data-urlencode "limit=${2:-3}"; }
+
+s "login is slow in Europe" | python3 -m json.tool
+
+# what's stored
+sql "SELECT incident_id, model, vector_dims(embedding), content FROM incident_embeddings ORDER BY 1;"
+sql "SELECT source, chunk_index, heading, vector_dims(embedding) FROM runbook_chunks ORDER BY 1, 2;"
+```
+
+| Scenario | How | What you should see |
+|---|---|---|
+| Different words, same meaning | `s "login is slow in Europe"` | A DNS incident first, and `dns-latency.md` sections in `runbooks` |
+| The right section | `s "browser says connection not private"` | `tls-certificate-expired.md`, heading `Symptoms`, first |
+| New incident becomes searchable | Create an incident, wait a few seconds, search for it in other words | The embedder logs `embedding saved`, and the incident is the top hit |
+| Unchanged update | `PUT` an incident with the same title, severity and status | `text unchanged, embedding kept` |
+| Edit a runbook | Change one file in `runbooks/`, run `go run ./cmd/ingest` | Only that file is `ingested`; the others are `unchanged, skipped` |
+| Delete a runbook | Move a file out of `runbooks/`, run ingest | `removed chunks of runbooks that no longer exist` |
+| Ollama down | `brew services stop ollama`, then search | `503 search is unavailable right now`, while `GET /incidents` still works. The embedder and ingest refuse to start |
+| Bad input | No `q`, or `limit=50` | `400` |
 
 ## Gateway
 
@@ -640,6 +754,34 @@ A partial index (`WHERE published_at IS NULL`) keeps the relay's query fast as p
 
 The primary key is `(consumer, event_id)`, so each service keeps its own record and a future consumer can process the same events independently.
 
+`004_create_incident_embeddings.sql` enables the `vector` extension (so Postgres must run the pgvector image) and creates **incident_embeddings**, one row per incident:
+
+| Column | Type | Notes |
+|---|---|---|
+| `incident_id` | `BIGINT` | Primary key, and a foreign key to `incidents` with `ON DELETE CASCADE` |
+| `content` | `TEXT` | The exact text that was embedded |
+| `model` | `TEXT` | Which model made the vector, for example `nomic-embed-text` |
+| `embedding` | `vector(768)` | The vector |
+| `updated_at` | `TIMESTAMPTZ` | Defaults to `now()` |
+
+It's a separate table rather than a column on `incidents`, so the API works the same whether or not a vector exists yet.
+
+`005_create_runbook_chunks.sql` creates **runbook_chunks**, one row per runbook section:
+
+| Column | Type | Notes |
+|---|---|---|
+| `source` | `TEXT` | The file, for example `runbooks/disk-full.md` |
+| `chunk_index` | `INT` | Position in the file, from 0. The primary key is `(source, chunk_index)` |
+| `title` | `TEXT` | The runbook's `# ` heading |
+| `heading` | `TEXT` | The section, for example `Fix > Free space quickly` |
+| `content` | `TEXT` | The exact text that was embedded, returned in search results |
+| `file_hash` | `TEXT` | SHA-256 of the whole file, to skip unchanged files |
+| `model` | `TEXT` | Which model made the vector |
+| `embedding` | `vector(768)` | The vector |
+| `updated_at` | `TIMESTAMPTZ` | Defaults to `now()` |
+
+Both tables have an HNSW index on `embedding` with `vector_cosine_ops`, which serves `ORDER BY embedding <=> $1`.
+
 Open a SQL shell:
 
 ```bash
@@ -650,6 +792,8 @@ docker exec -it opspilot-postgres psql -U opspilot -d opspilot
 SELECT * FROM incidents;
 SELECT * FROM outbox;
 SELECT * FROM processed_events;
+SELECT incident_id, model, content FROM incident_embeddings;   -- leave out embedding: 768 numbers per row
+SELECT source, chunk_index, heading FROM runbook_chunks ORDER BY 1, 2;
 \d incidents   -- show the table definition
 \q             -- quit
 ```
@@ -674,10 +818,16 @@ All programs use Go's structured logger (`log/slog`) and write text logs to stdo
 | `internal/outbox/relay.go` | WARN | A publish failed (for example Kafka unreachable). The relay retries on the next tick |
 | `cmd/server/main.go` | INFO | Config loaded (including which backends are enabled), server start, graceful shutdown and how long it took |
 | `cmd/server/main.go` | WARN | A backend is switched off: no `DATABASE_URL`, `REDIS_URL` or `KAFKA_BROKERS` |
-| `internal/notifier/consumer.go` | INFO | Consumer started and stopped; `event written` (event ID, type, incident, partition, offset, file, attempt); `duplicate event skipped` |
-| `internal/notifier/consumer.go` | WARN | `attempt failed, retrying`; `fetch failed, retrying` (Kafka unreachable); commit failed; Postgres unavailable for the duplicate check |
-| `internal/notifier/consumer.go` | ERROR | `event moved to DLQ` (attempts, whether the error was permanent, the cause) |
-| `cmd/notifier/main.go` | INFO / ERROR | Config loaded (number of consumers), readers and DLQ writer closed; a consumer failed and the notifier is stopping |
+| `internal/consumer/consumer.go` | INFO | Consumer started and stopped; `duplicate event skipped`. Messages start with the service name, for example `notifier consumer started` or `embedder: duplicate event skipped` |
+| `internal/consumer/consumer.go` | WARN | `attempt failed, retrying`; `fetch failed, retrying` (Kafka unreachable); commit failed; Postgres unavailable for the duplicate check |
+| `internal/consumer/consumer.go` | ERROR | `event moved to DLQ` (attempts, whether the error was permanent, the cause) |
+| `internal/consumer/group.go` | INFO / ERROR | Readers closed; a consumer failed and the service is stopping |
+| `internal/notifier/process.go` | INFO | `notifier: event written` (event ID, type, incident, partition, offset, file, attempt) |
+| `cmd/notifier/main.go` | INFO | Config loaded (number of consumers), DLQ writer closed |
+| `internal/embedder/process.go` | INFO | `embedding saved` (model, dims), `text unchanged, embedding kept`, `embedding deleted`, `incident no longer exists, skipped` |
+| `cmd/embedder/main.go` | INFO / ERROR | Config loaded (Ollama URL, model, dims); `startup failed: embedding model not ready` |
+| `cmd/ingest/main.go` | INFO / ERROR | Per file: `runbook ingested` (chunks, time), `runbook unchanged, skipped` or `runbook failed`; `removed chunks of runbooks that no longer exist`; an `ingest finished` summary |
+| `internal/handler/search.go` | INFO / ERROR | `search done` (query length, number of hits, time). The query text isn't logged. `search failed` (usually Ollama down) |
 | `internal/grpcserver/logging.go` | INFO / WARN / ERROR | One `grpc request` line per call: method, user, code, duration. WARN for caller errors (`NotFound`, `InvalidArgument`), ERROR for ours (`Internal`) |
 | `internal/grpcserver/incident.go` | INFO / ERROR | Incident created, updated or deleted, with `api=grpc`; unexpected store errors |
 | `internal/gateway/auth.go` | INFO / WARN | `login succeeded` (username, role), `login failed`, `token rejected` (with the reason: invalid or expired) |
@@ -807,6 +957,12 @@ A message being retried at that moment isn't committed (`message will be redeliv
 | **Gateway:** Redis unreachable at startup | Logs `could not connect to redis` and exits. Without `REDIS_URL`, it starts with rate limits off |
 | **Gateway:** Redis goes down while running | Requests are allowed without limits (fail open). Limits come back by themselves |
 | **Gateway:** the server is down | `502 upstream unavailable`. Login still works, because the gateway handles `/login` itself |
+| **Server:** Ollama down | The server starts and works normally; only `/search` returns `503` |
+| **Embedder / ingest:** Ollama down or the model not pulled at startup | Logs `startup failed: embedding model not ready (is Ollama running? ...)` and exits |
+| **Embedder:** Ollama goes down while running | Each event is retried, then goes to the DLQ with `dlq_consumer=embedder` |
+| **Embedder:** the model returns a vector of the wrong size | Permanent error: the event goes straight to the DLQ |
+| **Ingest:** one file fails | Logged as `runbook failed`; its old chunks stay, the other files continue, exit code `1` |
+| **Ingest:** the folder is empty or missing | Refuses to run, so it doesn't delete every stored runbook |
 
 ## Project structure
 
@@ -815,7 +971,10 @@ A message being retried at that moment isn't committed (`message will be redeliv
 ├── cmd/
 │   ├── server/main.go               # API entry point: config, logger, store choice, Redis, Kafka relay, HTTP and gRPC servers, graceful shutdown
 │   ├── notifier/main.go             # consumer entry point: starts NOTIFIER_CONSUMERS consumers in one group, shared DLQ writer
+│   ├── embedder/main.go             # embedder entry point: Ollama startup check, then a consumer group that stores incident vectors
+│   ├── ingest/main.go               # runbook ingest command: -dir, -dry-run, -force
 │   └── gateway/main.go              # gateway entry point: builds the /login and API handler chains
+├── runbooks/                        # sample Markdown runbooks (DNS latency, disk full, TLS certificate expired)
 ├── proto/incident/v1/incident.proto # the gRPC contract (source of truth)
 ├── gen/incident/v1/                 # Go code generated from the .proto (don't edit by hand)
 │   ├── incident.pb.go               # message types: Incident, CreateIncidentRequest...
@@ -823,7 +982,9 @@ A message being retried at that moment isn't committed (`message will be redeliv
 ├── migrations/
 │   ├── 001_create_incidents.sql     # incidents table
 │   ├── 002_create_outbox.sql        # outbox table for events waiting to go to Kafka
-│   └── 003_create_processed_events.sql  # events a consumer has already handled
+│   ├── 003_create_processed_events.sql  # events a consumer has already handled
+│   ├── 004_create_incident_embeddings.sql  # pgvector extension + one vector per incident
+│   └── 005_create_runbook_chunks.sql   # one vector per runbook section
 ├── out/                             # notifier output files (created at runtime, ignored by git)
 └── internal/
     ├── config/config.go             # reads all env vars (see Configuration)
@@ -832,9 +993,20 @@ A message being retried at that moment isn't committed (`message will be redeliv
     ├── outbox/
     │   ├── kafka.go                 # Kafka producer and startup check (also used by the notifier)
     │   └── relay.go                 # moves outbox rows to Kafka
+    ├── consumer/
+    │   ├── consumer.go              # shared Kafka loop: fetch, duplicate check, retries, DLQ, commit
+    │   └── group.go                 # runs N consumers in one group; DLQ writer
     ├── notifier/
-    │   ├── consumer.go              # fetch, duplicate check, retries, DLQ, commit
+    │   ├── process.go               # handles one event: write a line
     │   └── writer.go                # appends a line to out/consumer_<n>_hello.txt
+    ├── embedding/
+    │   ├── embedding.go             # Embedder interface, 768 dimensions, vector → pgvector text
+    │   └── ollama.go                # Ollama client, adds the search_document / search_query prefixes
+    ├── embedder/process.go          # handles one event: embed and upsert, or delete
+    ├── runbook/
+    │   ├── chunk.go                 # splits Markdown into sections (code-block aware)
+    │   └── ingest.go                # hash check, embed, replace a file's chunks in one transaction; remove deleted files
+    ├── search/search.go             # embeds the question, nearest incidents and runbook chunks
     ├── store/
     │   ├── postgres.go              # PostgreSQL store; writes the incident and its outbox event in one transaction
     │   ├── memory.go                # in-memory store, used when DATABASE_URL is empty
@@ -845,6 +1017,7 @@ A message being retried at that moment isn't committed (`message will be redeliv
     ├── handler/
     │   ├── incident.go              # /incidents routes, validation, status codes
     │   ├── alert.go                 # /alerts webhook
+    │   ├── search.go                # /search: q and limit checks, 503 when search fails
     │   └── response.go              # writeJSON / writeError helpers
     ├── grpcserver/
     │   ├── incident.go              # implements IncidentService on the same store; errors → gRPC codes
@@ -877,6 +1050,12 @@ PUT /incidents/7 → ... → PostgresStore ─┬─ UPDATE incidents   ┐ one 
                          Notifier (separate process) ◀────────┘ → out/consumer_<n>_hello.txt
                                                                 → processed_events (Postgres)
                                                                 → incident.events.dlq (on failure)
+                         Embedder (separate process) ◀────────┘ → Ollama → incident_embeddings (Postgres)
+
+go run ./cmd/ingest → runbooks/*.md → split into sections → Ollama → runbook_chunks (Postgres)
+
+GET /search?q=... → SearchHandler → Ollama (embed the question once) ─┬─ nearest incident_embeddings
+                                                                      └─ nearest runbook_chunks
 
 Through the gateway:
 DELETE /incidents/7 → gateway :8082 → Logging → RequireAuth → user limit → RequireRole (admin?) → proxy → server :8087
@@ -901,7 +1080,11 @@ The handlers depend on the `IncidentStore` interface, not on a concrete store. `
    - 5c. ✅ Role-based access (RBAC)
    - 5d. ✅ Rate limiting with Redis
    - 5e. ✅ gRPC API (`.proto` contract, generated code, gRPC server) and a separate client repo
-6. pgvector embeddings and document ingestion
+6. ✅ pgvector embeddings and document ingestion
+   - 6a. ✅ pgvector in Postgres, `incident_embeddings` table
+   - 6b. ✅ Embedder service with Ollama, sharing the consumer loop with the notifier
+   - 6c. ✅ Runbook chunking and ingest
+   - 6d. ✅ `GET /search` over incidents and runbooks
 7. RAG question answering with Claude
 8. MCP server exposing OpsPilot tools to AI agents
 9. Observability (OpenTelemetry, Prometheus, Grafana), Docker and Kubernetes

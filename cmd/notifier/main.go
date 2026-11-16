@@ -6,13 +6,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/segmentio/kafka-go"
-
 	"opspilot/internal/config"
+	"opspilot/internal/consumer"
 	"opspilot/internal/event"
 	"opspilot/internal/notifier"
 	"opspilot/internal/outbox"
@@ -64,13 +62,7 @@ func run() int {
 	defer pg.Close()
 
 	// One DLQ writer and one Postgres pool are shared: both are safe to use from many goroutines.
-	dlq := &kafka.Writer{
-		Addr:         kafka.TCP(cfg.KafkaBrokers...),
-		Topic:        event.DLQTopic,
-		Balancer:     &kafka.Hash{},
-		RequiredAcks: kafka.RequireAll,
-		BatchTimeout: 10 * time.Millisecond,
-	}
+	dlq := consumer.NewDLQWriter(cfg.KafkaBrokers)
 	defer func() {
 		dlq.Close()
 		slog.Info("dlq writer closed")
@@ -78,53 +70,24 @@ func run() int {
 
 	slog.Info("notifier config loaded", "log_level", level.String(), "consumers", cfg.NotifierConsumers)
 
-	// If one consumer fails (e.g. the DLQ is unreachable), cancel runCtx to stop the others too,
-	// so the whole service exits and gets restarted instead of running half-broken.
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	failed := false
-
-	for i := 1; i <= cfg.NotifierConsumers; i++ {
-		writer, err := notifier.NewFileWriter("out", strconv.Itoa(i))
-		if err != nil {
-			slog.Error("startup failed", "error", err)
-			return 1
-		}
-
-		// Each consumer has its own reader, and all readers share one GroupID. Kafka sees them
-		// as separate group members and gives each its own partitions, exactly as if they were
-		// separate processes.
-		reader := kafka.NewReader(kafka.ReaderConfig{
-			Brokers:     cfg.KafkaBrokers,
-			GroupID:     "opspilot-notifier",
-			Topic:       event.Topic,
-			StartOffset: kafka.FirstOffset, // a brand-new group starts from the oldest message
-			MaxWait:     500 * time.Millisecond,
-		})
-		defer func() {
-			reader.Close()
-			slog.Info("kafka reader closed", "consumer_id", i)
-		}()
-
-		consumer := notifier.NewConsumer(i, reader, dlq, pg.Pool(), writer)
-		wg.Go(func() {
-			if err := consumer.Run(runCtx); err != nil {
-				slog.Error("consumer failed, stopping the notifier", "consumer_id", i, "error", err)
-				mu.Lock()
-				failed = true
-				mu.Unlock()
-				cancelRun()
+	group := consumer.Group{
+		Name:    "notifier",
+		Brokers: cfg.KafkaBrokers,
+		Count:   cfg.NotifierConsumers,
+		DLQ:     dlq,
+		Pool:    pg.Pool(),
+		// Each consumer writes its own file, out/consumer_<id>_hello.txt.
+		NewProcess: func(id int) (consumer.ProcessFunc, error) {
+			writer, err := notifier.NewFileWriter("out", strconv.Itoa(id))
+			if err != nil {
+				return nil, err
 			}
-		})
+			return notifier.NewProcess(writer), nil
+		},
 	}
-
-	wg.Wait() // until Ctrl+C, or until one consumer fails
-	// deferred Close() calls run now in reverse order: readers, DLQ writer, then Postgres
-	if failed {
+	if !group.Run(ctx) { // until Ctrl+C, or until one consumer fails
 		return 1
 	}
+	// deferred Close() calls run now in reverse order: DLQ writer, then Postgres
 	return 0
 }

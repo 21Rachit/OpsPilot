@@ -18,11 +18,13 @@ import (
 	incidentv1 "opspilot/gen/incident/v1"
 	"opspilot/internal/cache"
 	"opspilot/internal/config"
+	"opspilot/internal/embedding"
 	"opspilot/internal/event"
 	"opspilot/internal/grpcserver"
 	"opspilot/internal/handler"
 	"opspilot/internal/middleware"
 	"opspilot/internal/outbox"
+	"opspilot/internal/search"
 	"opspilot/internal/store"
 )
 
@@ -132,6 +134,14 @@ func main() {
 	r := mux.NewRouter()
 	incidents.RegisterRoutes(r)
 	alerts.RegisterRoutes(r)
+	// Search needs the vectors in Postgres. Ollama is only needed when someone searches,
+	// so the server starts even if it's down: /search then answers 503 and the rest works.
+	if pg == nil {
+		slog.Warn("search disabled: needs postgres (the vectors are stored there)")
+	} else {
+		emb := embedding.NewOllama(cfg.OllamaURL, cfg.EmbeddingModel)
+		handler.NewSearchHandler(search.NewSearcher(emb, pg.Pool())).RegisterRoutes(r)
+	}
 
 	// The gRPC API serves the same incidents from the same store. The gateway uses it.
 	// Listen before starting the goroutine, so a port that's already in use stops the
