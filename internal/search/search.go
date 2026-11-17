@@ -35,6 +35,7 @@ type RunbookHit struct {
 type Results struct {
 	Query     string        `json:"query"`
 	Model     string        `json:"model"`
+	MinScore  float64       `json:"min_score"`
 	Incidents []IncidentHit `json:"incidents"`
 	Runbooks  []RunbookHit  `json:"runbooks"`
 }
@@ -50,35 +51,36 @@ func NewSearcher(emb embedding.Embedder, pool *pgxpool.Pool) *Searcher {
 }
 
 // Search embeds query once and returns up to limit incidents and up to limit runbook sections.
-func (s *Searcher) Search(ctx context.Context, query string, limit int) (Results, error) {
+// Matches scoring below minScore are left out (0 keeps everything).
+func (s *Searcher) Search(ctx context.Context, query string, limit int, minScore float64) (Results, error) {
 	vec, err := s.emb.EmbedQuery(ctx, query) // "search_query: " prefix, not "search_document: "
 	if err != nil {
 		return Results{}, fmt.Errorf("embed query: %w", err)
 	}
 	q := embedding.ToPgvector(vec)
 
-	incidents, err := s.incidents(ctx, q, limit)
+	incidents, err := s.incidents(ctx, q, limit, minScore)
 	if err != nil {
 		return Results{}, err
 	}
-	runbooks, err := s.runbooks(ctx, q, limit)
+	runbooks, err := s.runbooks(ctx, q, limit, minScore)
 	if err != nil {
 		return Results{}, err
 	}
-	return Results{Query: query, Model: s.emb.Model(), Incidents: incidents, Runbooks: runbooks}, nil
+	return Results{Query: query, Model: s.emb.Model(), MinScore: minScore, Incidents: incidents, Runbooks: runbooks}, nil
 }
 
 // incidents joins incident_embeddings to incidents, so the result has the incident's current
 // title and status. The model filter skips vectors made by a different model: they can't be
 // compared with this query's vector.
-func (s *Searcher) incidents(ctx context.Context, q string, limit int) ([]IncidentHit, error) {
+func (s *Searcher) incidents(ctx context.Context, q string, limit int, minScore float64) ([]IncidentHit, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT i.id, i.title, i.severity, i.status, i.created_at, 1 - (e.embedding <=> $1::vector)
 		FROM incident_embeddings e
 		JOIN incidents i ON i.id = e.incident_id
-		WHERE e.model = $2
+		WHERE e.model = $2 AND 1 - (e.embedding <=> $1::vector) >= $4
 		ORDER BY e.embedding <=> $1::vector
-		LIMIT $3`, q, s.emb.Model(), limit)
+		LIMIT $3`, q, s.emb.Model(), limit, minScore)
 	if err != nil {
 		return nil, fmt.Errorf("search incidents: %w", err)
 	}
@@ -95,13 +97,13 @@ func (s *Searcher) incidents(ctx context.Context, q string, limit int) ([]Incide
 	return hits, rows.Err()
 }
 
-func (s *Searcher) runbooks(ctx context.Context, q string, limit int) ([]RunbookHit, error) {
+func (s *Searcher) runbooks(ctx context.Context, q string, limit int, minScore float64) ([]RunbookHit, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT source, title, heading, content, 1 - (embedding <=> $1::vector)
 		FROM runbook_chunks
-		WHERE model = $2
+		WHERE model = $2 AND 1 - (embedding <=> $1::vector) >= $4
 		ORDER BY embedding <=> $1::vector
-		LIMIT $3`, q, s.emb.Model(), limit)
+		LIMIT $3`, q, s.emb.Model(), limit, minScore)
 	if err != nil {
 		return nil, fmt.Errorf("search runbooks: %w", err)
 	}

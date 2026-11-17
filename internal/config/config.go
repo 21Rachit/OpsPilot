@@ -28,9 +28,12 @@ type Config struct {
 	RateLimit         int           // requests each user may make per RateLimitWindow
 	LoginRateLimit    int           // login attempts each client IP may make per RateLimitWindow
 	RateLimitWindow   time.Duration
-	OllamaURL         string // where the Ollama server runs the embedding model
-	EmbeddingModel    string // which model turns text into vectors; must produce 768 numbers
-	EmbedderConsumers int    // how many consumers the embedder runs
+	OllamaURL         string        // where the Ollama server runs the embedding model
+	EmbeddingModel    string        // which model turns text into vectors; must produce 768 numbers
+	EmbedderConsumers int           // how many consumers the embedder runs
+	ClaudeBin         string        // the Claude Code program; "claude" means look it up in PATH
+	LLMModel          string        // which Claude model answers questions
+	LLMTimeout        time.Duration // how long one answer may take before we give up
 }
 
 func Load() (Config, error) {
@@ -70,6 +73,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	llmTimeout, err := getDuration("LLM_TIMEOUT", 90*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		Port:        getEnv("PORT", "8087"),
@@ -94,6 +101,9 @@ func Load() (Config, error) {
 		OllamaURL:         getEnv("OLLAMA_URL", "http://localhost:11434"),
 		EmbeddingModel:    getEnv("EMBEDDING_MODEL", "nomic-embed-text"),
 		EmbedderConsumers: embedderConsumers,
+		ClaudeBin:         getEnv("CLAUDE_BIN", "claude"),
+		LLMModel:          getEnv("LLM_MODEL", "claude-opus-5-5"),
+		LLMTimeout:        llmTimeout,
 	}, nil
 }
 

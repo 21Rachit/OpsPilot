@@ -22,8 +22,10 @@ import (
 	"opspilot/internal/event"
 	"opspilot/internal/grpcserver"
 	"opspilot/internal/handler"
+	"opspilot/internal/llm"
 	"opspilot/internal/middleware"
 	"opspilot/internal/outbox"
+	"opspilot/internal/rag"
 	"opspilot/internal/search"
 	"opspilot/internal/store"
 )
@@ -140,7 +142,17 @@ func main() {
 		slog.Warn("search disabled: needs postgres (the vectors are stored there)")
 	} else {
 		emb := embedding.NewOllama(cfg.OllamaURL, cfg.EmbeddingModel)
-		handler.NewSearchHandler(search.NewSearcher(emb, pg.Pool())).RegisterRoutes(r)
+		searcher := search.NewSearcher(emb, pg.Pool())
+		handler.NewSearchHandler(searcher).RegisterRoutes(r)
+
+		// /ask = search + Claude. Without the claude program only /ask is turned off.
+		claude, err := llm.NewClaudeCLI(cfg.ClaudeBin, cfg.LLMModel, cfg.LLMTimeout)
+		if err != nil {
+			slog.Warn("ask disabled", "error", err)
+		} else {
+			handler.NewAskHandler(rag.NewAsker(searcher, claude)).RegisterRoutes(r)
+			slog.Info("ask enabled", "model", cfg.LLMModel)
+		}
 	}
 
 	// The gRPC API serves the same incidents from the same store. The gateway uses it.

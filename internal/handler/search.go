@@ -21,7 +21,7 @@ const (
 
 // Searcher is what the handler needs from the search package.
 type Searcher interface {
-	Search(ctx context.Context, query string, limit int) (search.Results, error)
+	Search(ctx context.Context, query string, limit int, minScore float64) (search.Results, error)
 }
 
 type SearchHandler struct {
@@ -36,7 +36,7 @@ func (h *SearchHandler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/search", h.Search).Methods(http.MethodGet)
 }
 
-// Search handles GET /search?q=...&limit=...
+// Search handles GET /search?q=...&limit=...&min_score=...
 func (h *SearchHandler) Search(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
@@ -58,8 +58,20 @@ func (h *SearchHandler) Search(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
+	// min_score drops weak matches. Vector search always returns the nearest rows, even when
+	// none of them is about the question; a score floor turns "nearest" into "relevant".
+	minScore := 0.0
+	if s := r.URL.Query().Get("min_score"); s != "" {
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || !(f >= 0 && f <= 1) { // written this way so NaN is rejected too
+			writeError(w, http.StatusBadRequest, "min_score must be a number from 0 to 1, e.g. 0.6")
+			return
+		}
+		minScore = f
+	}
+
 	start := time.Now()
-	res, err := h.searcher.Search(r.Context(), q, limit)
+	res, err := h.searcher.Search(r.Context(), q, limit, minScore)
 	if err != nil {
 		// Usually Ollama is down. The rest of the API still works, so say "unavailable"
 		// (503) instead of a generic 500.
