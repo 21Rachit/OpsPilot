@@ -2,7 +2,7 @@
 
 An incident-tracking REST API written in Go, built step by step as a learning project.
 
-OpsPilot will eventually become an AI-powered incident response copilot, with RAG and an MCP server. It currently covers **Step 7**:
+OpsPilot will eventually become an AI-powered incident response copilot, with RAG and an MCP server. It currently covers **Step 8**:
 
 - CRUD operations on incidents, stored in **PostgreSQL**
 - A **Redis** cache in front of `GET /incidents/{id}`
@@ -13,9 +13,10 @@ OpsPilot will eventually become an AI-powered incident response copilot, with RA
 - A **gRPC API** for incidents, next to the HTTP one, defined by a `.proto` contract
 - **Semantic search** (`GET /search`) over incidents and Markdown runbooks, using embeddings from a local model (**Ollama**) stored in **pgvector**
 - **Question answering** (`POST /ask`) with RAG: the search results are given to **Claude**, which answers from them and cites them as `[1]`, `[2]`, ...
+- An **MCP server** that lets AI agents such as Claude Code use OpsPilot as tools (list, get, search and create incidents), logged in through the gateway so the agent gets a user's role
 - Structured logging and graceful shutdown
 
-The repo builds five programs:
+The repo builds six programs:
 
 | Program | Command | What it does |
 |---|---|---|
@@ -24,17 +25,18 @@ The repo builds five programs:
 | Embedder | `go run ./cmd/embedder` | Reads the same events and stores a vector for each incident in `incident_embeddings` (another consumer) |
 | Ingest | `go run ./cmd/ingest` | A command you run, not a service: splits `runbooks/*.md` into sections and stores a vector for each in `runbook_chunks` |
 | Gateway | `go run ./cmd/gateway` | The front door on `:8082`: checks the token, role and rate limit, then forwards the request to the server |
+| MCP server | `go build -o bin/opspilot-mcp ./cmd/mcp` | Started by an AI agent (Claude Code), not by you: offers OpsPilot as MCP tools over stdin/stdout and calls the API through the gateway |
 
 A separate repo, **`opspilot-client`**, is a command-line client for the gRPC API. It shares only a copy of the `.proto` file with this repo. See [gRPC API](#grpc-api).
 
-All of the server's backing services are optional. Without `DATABASE_URL` the server uses an in-memory store. Without `REDIS_URL`, caching and de-duplication are switched off. Without `KAFKA_BROKERS`, events are still recorded in the outbox table but aren't published. `/search` needs `DATABASE_URL`, and Ollama only when a search runs. `/ask` needs the same, plus the Claude Code CLI (`claude`) installed and logged in; without it, only `/ask` is switched off. The notifier and the embedder need both `DATABASE_URL` and `KAFKA_BROKERS`, and the embedder and ingest also need Ollama.
+All of the server's backing services are optional. Without `DATABASE_URL` the server uses an in-memory store. Without `REDIS_URL`, caching and de-duplication are switched off. Without `KAFKA_BROKERS`, events are still recorded in the outbox table but aren't published. `/search` needs `DATABASE_URL`, and Ollama only when a search runs. `/ask` needs the same, plus the Claude Code CLI (`claude`) installed and logged in; without it, only `/ask` is switched off. The notifier and the embedder need both `DATABASE_URL` and `KAFKA_BROKERS`, and the embedder and ingest also need Ollama. The MCP server needs only a running server (and the gateway, when it logs in).
 
 ## Prerequisites
 
 - Go 1.26.5 or newer (see `go.mod`)
 - Docker, to run PostgreSQL (with the pgvector extension), Redis and Kafka
 - [Ollama](https://ollama.com) (`brew install ollama`), to run the embedding model `nomic-embed-text` locally. Only for the embedder, ingest, `/search` and `/ask`
-- [Claude Code](https://claude.com/claude-code) (`claude`), logged in. Only for `/ask`. See [Why the Claude Code CLI?](#why-the-claude-code-cli)
+- [Claude Code](https://claude.com/claude-code) (`claude`), logged in. Only for `/ask` and for using the MCP server. See [Why the Claude Code CLI?](#why-the-claude-code-cli)
 - `curl`, for calling the API
 - Only if you change `proto/`: `protoc` and the Go plugins, to regenerate `gen/` (see [Changing the contract](#changing-the-contract))
 - Optional: `grpcurl` (`brew install grpcurl`), to call the gRPC API by hand
@@ -177,15 +179,18 @@ All settings come from environment variables.
 | `RATE_LIMIT` | `60` | Gateway only. Requests each user may make per `RATE_LIMIT_WINDOW` |
 | `LOGIN_RATE_LIMIT` | `5` | Gateway only. Login attempts each client IP may make per `RATE_LIMIT_WINDOW` |
 | `RATE_LIMIT_WINDOW` | `1m` | Gateway only. The time window both limits count over |
+| `OPSPILOT_URL` | `http://localhost:8087` | MCP server only. The OpsPilot API its tools call. Use the gateway, `http://localhost:8082`, so roles apply |
+| `OPSPILOT_USER` | *(empty)* | MCP server only. Log in at the gateway as this user; the agent gets this user's role. Empty means no login, which only works against the server directly |
+| `OPSPILOT_PASSWORD` | *(empty)* | MCP server only. That user's password. Never logged |
 
-The notifier reads `DATABASE_URL`, `KAFKA_BROKERS`, `LOG_LEVEL` and `NOTIFIER_CONSUMERS`, and ignores the rest. The embedder reads the same plus `OLLAMA_URL`, `EMBEDDING_MODEL` and `EMBEDDER_CONSUMERS`. Ingest reads `DATABASE_URL`, `LOG_LEVEL`, `OLLAMA_URL` and `EMBEDDING_MODEL`. The gateway reads `REDIS_URL` (for rate limits; without it, limits are off), `LOG_LEVEL` and the `GATEWAY_PORT` … `RATE_LIMIT_WINDOW` settings.
+The notifier reads `DATABASE_URL`, `KAFKA_BROKERS`, `LOG_LEVEL` and `NOTIFIER_CONSUMERS`, and ignores the rest. The embedder reads the same plus `OLLAMA_URL`, `EMBEDDING_MODEL` and `EMBEDDER_CONSUMERS`. Ingest reads `DATABASE_URL`, `LOG_LEVEL`, `OLLAMA_URL` and `EMBEDDING_MODEL`. The gateway reads `REDIS_URL` (for rate limits; without it, limits are off), `LOG_LEVEL` and the `GATEWAY_PORT` … `RATE_LIMIT_WINDOW` settings. The MCP server reads `OPSPILOT_URL`, `OPSPILOT_USER` and `OPSPILOT_PASSWORD`.
 
 Durations use Go syntax: `30s`, `5m`, `1h`. An invalid value (for example `CACHE_TTL=abc`, `NOTIFIER_CONSUMERS=0` or a short `JWT_SECRET`) stops the program at startup with an `invalid config` error.
 
 ## Build and checks
 
 ```bash
-go mod download   # download dependencies (gorilla/mux, pgx, go-redis, kafka-go, golang-jwt, bcrypt, grpc)
+go mod download   # download dependencies (gorilla/mux, pgx, go-redis, kafka-go, golang-jwt, bcrypt, grpc, the MCP go-sdk)
 go build ./...    # compile every package
 go vet ./...      # static checks
 ```
@@ -208,7 +213,7 @@ docker exec -it opspilot-kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --property print.key=true --property print.partition=true --property print.headers=true
 ```
 
-To test the notifier, see [Notifier → Checking it works](#checking-it-works). To test the gateway, see [Gateway → Trying it](#trying-it). To test search, see [Semantic search → Trying it](#trying-search). To test `/ask`, see [Trying /ask](#trying-ask). To test the gRPC API, see [gRPC API → Calling it](#calling-it).
+To test the notifier, see [Notifier → Checking it works](#checking-it-works). To test the gateway, see [Gateway → Trying it](#trying-it). To test search, see [Semantic search → Trying it](#trying-search). To test `/ask`, see [Trying /ask](#trying-ask). To test the gRPC API, see [gRPC API → Calling it](#calling-it). To test the MCP server, see [Using it with Claude Code](#using-it-with-claude-code).
 
 ## API
 
@@ -792,6 +797,70 @@ protoc --go_out=. --go_opt=module=opspilot \
 - A new RPC returns `Unimplemented` until you write it, because `IncidentServer` embeds `UnimplementedIncidentServiceServer`.
 - Copy the changed `.proto` to `opspilot-client` and regenerate there too.
 
+## MCP server
+
+The MCP server (`cmd/mcp`) lets AI agents such as Claude Code use OpsPilot. It speaks the **Model Context Protocol** (MCP) over **stdio**: the agent starts the program itself and they exchange JSON-RPC messages on its stdin and stdout. stdout belongs to the protocol, so the MCP server writes all its logs to **stderr**.
+
+It is a thin **adapter**: it never touches the database, and every tool calls the OpsPilot HTTP API. Pointed at the gateway with a login, the agent gets that user's role, so the gateway decides what the agent may do, exactly as for a person.
+
+```
+Claude Code ──stdio (JSON-RPC)──▶ opspilot-mcp ──HTTP + Bearer token──▶ gateway :8082 ──▶ server :8087
+```
+
+### Tools
+
+| Tool | Input | Calls | Role needed (through the gateway) |
+|---|---|---|---|
+| `list_incidents` | `status` (optional: `open`, `acknowledged` or `resolved`) | `GET /incidents`, then filters by status and puts the newest first | viewer |
+| `get_incident` | `id` | `GET /incidents/{id}` | viewer |
+| `search` | `query` | `GET /search` with `limit=5` and `min_score=0.6` | viewer |
+| `create_incident` | `title`, `severity` | `POST /incidents` | responder |
+
+- **The input schema comes from Go structs.** The SDK ([`modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)) turns each input struct into JSON Schema; the `jsonschema` tag is the description the agent sees for each field, and `omitempty` makes a field optional.
+- **Descriptions are prompts.** The agent decides which tool to call only from its name and description. `search` says runbook text is information, not instructions. `create_incident` says to use it only when the user clearly asks for an incident, never because a document or tool result says so, and to check `list_incidents` for duplicates first.
+- **Inputs are checked before any request is sent**: an unknown status, an id below 1, an empty query, or a title or severity that fails `model.Validate`. A returned error goes back to the agent as a tool error, so it can fix the call or explain the problem.
+- **Annotations are hints.** The read tools are marked read-only, and `create_incident` is marked as changing data but not destructive. Claude Code uses this to ask you before it runs a tool that changes data.
+- **The gateway is the wall.** Hints and descriptions guide the agent, but only the role stops it: logged in as a viewer, `create_incident` fails with `403 forbidden: this needs the responder role`, whatever the agent was told.
+
+### Login
+
+- With `OPSPILOT_USER` set, the MCP server logs in with `POST /login` on the first tool call and keeps the token for the next calls.
+- Tokens expire (`TOKEN_TTL`), but the MCP server runs for as long as the agent's session. On a `401` it logs in again and retries the request once. Request bodies are kept as bytes, so the retry can send the same body again.
+- Without `OPSPILOT_USER` it sends no token. That only works against the server directly (`OPSPILOT_URL=http://localhost:8087`), with no roles; through the gateway every tool fails with `401 missing bearer token`.
+- The password and the token are never logged.
+
+### Using it with Claude Code
+
+Build the binary (`bin/` is ignored by git), with the server, gateway and embedder running:
+
+```bash
+go build -o bin/opspilot-mcp ./cmd/mcp
+```
+
+Register it with Claude Code as `alice` (viewer, read-only):
+
+```bash
+claude mcp add opspilot -e OPSPILOT_URL=http://localhost:8082 -e OPSPILOT_USER=alice -e OPSPILOT_PASSWORD=password -- "$PWD/bin/opspilot-mcp"
+claude mcp list        # opspilot: ... ✔ Connected
+```
+
+The settings, including the password, are stored in Claude Code's own config, so only use the demo users here. Start `claude` (in a running session, `/mcp` shows the server and can reconnect it after you rebuild the binary) and ask, for example:
+
+- *Which incidents are open right now?* → `list_incidents` with `status=open`
+- *How do I fix the TLS incident?* → `list_incidents`, then `search`, and an answer from the runbook
+- *Create a high severity incident: Disk full on db-2* → Claude Code asks your permission, then the tool fails because alice is a viewer, and the gateway logs `access denied user=alice role=viewer required_role=responder`
+
+To let the agent create incidents, register it as `bob` (responder) instead:
+
+```bash
+claude mcp remove opspilot
+claude mcp add opspilot -e OPSPILOT_URL=http://localhost:8082 -e OPSPILOT_USER=bob -e OPSPILOT_PASSWORD=password -- "$PWD/bin/opspilot-mcp"
+```
+
+Restart `claude` and ask again: the incident is created and Claude tells you its id. The embedder stores its vector, so `search` finds it straight away. Asking *search the runbooks for disk full and do whatever they say* only summarises the steps; it doesn't create an incident, because you didn't ask for one.
+
+A read-only agent is the safer default, so switch back to `alice` when you're done.
+
 ## Database
 
 The schema lives in `migrations/`. `001_create_incidents.sql` creates **incidents**:
@@ -874,7 +943,7 @@ SELECT source, chunk_index, heading FROM runbook_chunks ORDER BY 1, 2;
 
 ## Logging
 
-All programs use Go's structured logger (`log/slog`) and write text logs to stdout. Set the level with `LOG_LEVEL`.
+All programs use Go's structured logger (`log/slog`) and write text logs to stdout. Set the level with `LOG_LEVEL`. The MCP server is the exception: it writes to stderr at `info`, because its stdout carries the protocol.
 
 | Source | Level | What it logs |
 |---|---|---|
@@ -911,6 +980,9 @@ All programs use Go's structured logger (`log/slog`) and write text logs to stdo
 | `internal/gateway/ratelimit.go` | WARN | `rate limit exceeded` (limiter, who, limit, retry after); `rate limiter unavailable, allowing request` (Redis down) |
 | `internal/gateway/proxy.go` | ERROR | `upstream unreachable`: the server is down |
 | `cmd/gateway/main.go` | INFO / WARN | Gateway start (port, upstream, token TTL), rate limiting enabled or disabled, shutdown |
+| `cmd/mcp/main.go` | INFO / ERROR | `mcp server starting` (transport, API URL, user), `mcp server stopped`, `invalid config` |
+| `internal/mcpserver/tools.go` | INFO / WARN | One line per tool call: `mcp: list_incidents` (status, count), `mcp: get_incident` (id), `mcp: search` (query length and hits; the query text isn't logged), `mcp: create_incident` (id, severity); `mcp: create_incident failed` (for example 403) |
+| `internal/mcpserver/client.go` | INFO | `mcp: logged in to gateway` (username; the token is never logged) |
 
 Every notifier log line carries `consumer_id`, so you can tell the consumers apart.
 
@@ -1041,6 +1113,10 @@ A message being retried at that moment isn't committed (`message will be redeliv
 | **Embedder:** the model returns a vector of the wrong size | Permanent error: the event goes straight to the DLQ |
 | **Ingest:** one file fails | Logged as `runbook failed`; its old chunks stay, the other files continue, exit code `1` |
 | **Ingest:** the folder is empty or missing | Refuses to run, so it doesn't delete every stored runbook |
+| **MCP:** the gateway or server is down | The tool fails with `opspilot API unreachable at ...` (or `gateway unreachable` while logging in) and the agent tells you; the MCP server stays up |
+| **MCP:** wrong `OPSPILOT_USER` or `OPSPILOT_PASSWORD` | Every tool fails with `POST /login returned 401 ...` |
+| **MCP:** the token expires | Logs in again and retries once; the agent doesn't notice |
+| **MCP:** the user's role is too low | That tool fails with `403 forbidden: this needs the responder role`; read tools keep working |
 
 ## Project structure
 
@@ -1051,7 +1127,8 @@ A message being retried at that moment isn't committed (`message will be redeliv
 │   ├── notifier/main.go             # consumer entry point: starts NOTIFIER_CONSUMERS consumers in one group, shared DLQ writer
 │   ├── embedder/main.go             # embedder entry point: Ollama startup check, then a consumer group that stores incident vectors
 │   ├── ingest/main.go               # runbook ingest command: -dir, -dry-run, -force
-│   └── gateway/main.go              # gateway entry point: builds the /login and API handler chains
+│   ├── gateway/main.go              # gateway entry point: builds the /login and API handler chains
+│   └── mcp/main.go                  # MCP server entry point: logs to stderr, serves the tools over stdio
 ├── runbooks/                        # sample Markdown runbooks (DNS latency, disk full, TLS certificate expired)
 ├── proto/incident/v1/incident.proto # the gRPC contract (source of truth)
 ├── gen/incident/v1/                 # Go code generated from the .proto (don't edit by hand)
@@ -1064,6 +1141,7 @@ A message being retried at that moment isn't committed (`message will be redeliv
 │   ├── 004_create_incident_embeddings.sql  # pgvector extension + one vector per incident
 │   └── 005_create_runbook_chunks.sql   # one vector per runbook section
 ├── out/                             # notifier output files (created at runtime, ignored by git)
+├── bin/                             # built binaries such as opspilot-mcp (ignored by git)
 └── internal/
     ├── config/config.go             # reads all env vars (see Configuration)
     ├── model/incident.go            # Incident struct, allowed severity/status values, Validate (shared by HTTP and gRPC)
@@ -1114,6 +1192,9 @@ A message being retried at that moment isn't committed (`message will be redeliv
     │   ├── auth.go                  # POST /login, RequireAuth middleware, claims in the context
     │   ├── rbac.go                  # RequireRole: which role each HTTP method needs
     │   └── ratelimit.go             # fixed-window rate limiter in Redis, per user or per IP
+    ├── mcpserver/
+    │   ├── tools.go                 # the MCP tools: names, descriptions, input checks, annotations
+    │   └── client.go                # calls the OpsPilot API; gateway login, token cache, retry on 401
     └── middleware/logging.go        # per-request logging middleware (server and gateway)
 ```
 
@@ -1146,6 +1227,9 @@ POST /ask → AskHandler → rag.Asker ─┬─ Searcher (min_score 0.6) ──
 Through the gateway:
 DELETE /incidents/7 → gateway :8082 → Logging → RequireAuth → user limit → RequireRole (admin?) → proxy → server :8087
 
+From an AI agent:
+Claude Code → stdio → opspilot-mcp (create_incident) → POST /login, POST /incidents → gateway :8082 → RequireRole (responder?) → server :8087
+
 Over gRPC:
 grpcurl / opspilot-client → :9090 → LoggingInterceptor → IncidentServer.DeleteIncident → CachedStore → PostgresStore
 ```
@@ -1176,5 +1260,9 @@ The handlers depend on the `IncidentStore` interface, not on a concrete store. `
    - 7b. ✅ `min_score` in `/search`
    - 7c. ✅ `internal/rag` and `POST /ask` with numbered sources
    - 7d. ✅ Skip Claude when nothing relevant is found (prompt-injection hardening is still open, see [Known limitation](#why-the-claude-code-cli))
-8. MCP server exposing OpsPilot tools to AI agents
+8. ✅ MCP server exposing OpsPilot tools to AI agents
+   - 8a. ✅ MCP server over stdio with `list_incidents`, registered in Claude Code
+   - 8b. ✅ `get_incident` and `search` tools
+   - 8c. ✅ Through the gateway with a login, so the agent gets a user's role
+   - 8d. ✅ `create_incident`, a write tool that needs the responder role
 9. Observability (OpenTelemetry, Prometheus, Grafana), Docker and Kubernetes

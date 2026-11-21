@@ -34,6 +34,9 @@ type Config struct {
 	ClaudeBin         string        // the Claude Code program; "claude" means look it up in PATH
 	LLMModel          string        // which Claude model answers questions
 	LLMTimeout        time.Duration // how long one answer may take before we give up
+	OpsPilotURL       string        // MCP server only: the OpsPilot API it calls
+	OpsPilotUser      string        // MCP server only: log in at the gateway as this user (empty: no login)
+	OpsPilotPassword  string        // MCP server only: that user's password
 }
 
 func Load() (Config, error) {
@@ -104,6 +107,9 @@ func Load() (Config, error) {
 		ClaudeBin:         getEnv("CLAUDE_BIN", "claude"),
 		LLMModel:          getEnv("LLM_MODEL", "claude-opus-5-5"),
 		LLMTimeout:        llmTimeout,
+		OpsPilotURL:       getEnv("OPSPILOT_URL", "http://localhost:8087"),
+		OpsPilotUser:      os.Getenv("OPSPILOT_USER"),
+		OpsPilotPassword:  os.Getenv("OPSPILOT_PASSWORD"),
 	}, nil
 }
 
